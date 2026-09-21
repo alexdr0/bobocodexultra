@@ -7,8 +7,11 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Check the full reachable history for accidental disclosures.
       - uses: actions/setup-python@v5
         with:
           python-version: '3.14'
       - run: python3 -m unittest discover -s tests -p 'test_*.py' -q
+      - run: python3 scripts/check_public_safety.py
       - run: swiftc -typecheck -framework AppKit -framework SwiftUI BCUStatus.swift

@@ -4,16 +4,56 @@
 
 BCU adds OpenRouter models alongside native ChatGPT and Ollama models in the **Codex desktop app**. It runs a local routing service and keeps Codex's built-in OpenAI provider and existing ChatGPT sign-in. It does not patch the signed desktop application.
 
-Shared desktop routing requires macOS, the Codex desktop app, Python 3.14+ (for built-in zstd decompression), a working `codex` CLI on PATH, and an OpenRouter account/key. Check `python3 --version`. Clone this repository and keep `openrouter-codex`, `bcu_router.py`, `bcu_games.py`, and `BCUStatus.swift` together when installing:
+## Set up BCU on your Mac
+
+You need macOS, the Codex desktop app, Python 3.14+ (for built-in zstd decompression), the `codex` CLI on your PATH, and an OpenRouter account with an API key. Check the prerequisites first:
 
 ```sh
-cd bobocodexultra
-python3 openrouter-codex install
-bobocodexultra login
-bobocodexultra menu install
+python3 --version       # Must be 3.14 or newer
+command -v codex        # Must print a path
 ```
 
-`bobocodexultra` and its alias `boboultracodex` install into `~/.local/bin`. That directory must be on your PATH. Credentials are entered using macOS Keychain's secure terminal prompt; never put a key into a command argument or send it to an assistant.
+Clone the repository and install from its root; keep `openrouter-codex`, `bcu_router.py`, `bcu_games.py`, and `BCUStatus.swift` together:
+
+```sh
+git clone https://github.com/alexdr0/bobocodexultra.git
+cd bobocodexultra
+python3 openrouter-codex install
+export PATH="$HOME/.local/bin:$PATH"  # Current terminal only
+bobocodexultra --help
+```
+
+`bobocodexultra` and its alias `boboultracodex` install into `~/.local/bin`. Add that directory to your shell's PATH in your shell startup configuration to use the command in future terminals. You do not need `sudo`.
+
+```sh
+bobocodexultra login    # Secure Keychain prompt; activates shared desktop mode
+bobocodexultra models   # Search and choose which BCU models appear
+bobocodexultra doctor   # Check the local router and Codex integration
+```
+
+Quit and reopen Codex Desktop to refresh its model selector. Your native ChatGPT and existing Ollama models remain available alongside entries labeled `[Model Name] (BCU)`. To return to the previous native setup, run `bobocodexultra off` and reopen Codex. The optional menu bar companion installs with `bobocodexultra menu install`.
+
+Credentials are entered using macOS Keychain's secure terminal prompt; never put a key into a command argument, commit, issue, or assistant message. If you only want offline Snake, Pong, and Doom, the installation is enough—no key or desktop configuration is needed.
+
+## Set up your Codex agents
+
+BCU routes model requests; Codex itself spawns and manages subagents. After selecting your models, edit your **user-level** `~/.codex/config.toml` (or `$CODEX_HOME/config.toml` if you use a custom Codex home). Add these settings to its existing `[agents]` table, or create the table once if none exists:
+
+```toml
+[agents]
+enabled = true
+max_concurrent_threads_per_session = 2
+```
+
+Multi-agent tools are enabled by default, but the explicit settings make your intention and concurrency limit clear. For children to use a particular BCU model, run `bobocodexultra model list`, copy a **selected model's exact ID**, and add one line under that same `[agents]` table—for example, only if that ID is selected:
+
+```toml
+default_subagent_model = "anthropic/claude-opus-5"
+```
+
+Leave `default_subagent_model` unset if you prefer Codex's own default. An explicit model chosen when spawning a child takes precedence. Do not paste the example model ID blindly: choose a model you have access to, and remember that a model shown in the selector is not a guarantee of tool compatibility. Do not create a second `[agents]` table or overwrite existing user settings. Keep provider and authentication settings in the user-level configuration rather than a project's `.codex/config.toml`.
+
+Reopen Codex, choose a `(BCU)` model, and try a small, read-only task asking Codex to delegate two independent checks to subagents and combine their findings. Then repeat with a native model if you want to verify both routes. Delegation still depends on the task's instructions and the selected model's tool behavior. As an **optional billed** CLI-only check, `bobocodexultra codex smoke --agents` exercises the separate OpenRouter CLI profile; it does not validate every Codex Desktop workflow. See the [official Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference#configtoml) for the current agent settings.
 
 ## macOS menu bar
 
