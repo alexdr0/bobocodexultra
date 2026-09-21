@@ -95,7 +95,7 @@ struct RouterModel: Decodable, Identifiable {
     var displayName: String {
         let clean = name.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false)
         let withoutProvider = clean.count == 2 && clean[1].first == " " ? String(clean[1]).trimmingCharacters(in: .whitespaces) : name
-        return withoutProvider.prefix(1).uppercased() + withoutProvider.dropFirst() + " (BCU)"
+        return withoutProvider.prefix(1).uppercased() + withoutProvider.dropFirst() + " (Openrouter)"
     }
 }
 

@@ -1,6 +1,6 @@
 # How BCU fits into Codex Desktop
 
-Codex has one active provider and loads a model catalog on startup. BCU leaves the built-in `openai` provider active and changes only the provider's base URL to a loopback address. It copies the existing catalog, then appends the selected BCU models with a `(BCU)` display suffix. That catalog controls visibility, not per-model routing: the local service supplies the routing that the catalog cannot.
+Codex has one active provider and loads a model catalog on startup. BCU leaves the built-in `openai` provider active and changes only the provider's base URL to a loopback address. It copies the existing catalog, then appends the selected OpenRouter models with an `(Openrouter)` display suffix. That catalog controls visibility, not per-model routing: the local service supplies the routing that the catalog cannot.
 
 ```text
 Codex Desktop ── model request ──► 127.0.0.1:11435/v1

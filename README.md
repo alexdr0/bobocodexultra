@@ -26,7 +26,7 @@ export PATH="$HOME/.local/bin:$PATH"  # Current terminal only
 bobocodexultra doctor
 ```
 
-Quit and reopen Codex Desktop after enabling shared mode or changing models; native ChatGPT and existing Ollama models remain available alongside entries labeled `[Model Name] (BCU)`. To undo the desktop routing, run `bobocodexultra off` and reopen Codex. The wizard does not open Codex, read your saved key, or take over unrelated config settings. No `sudo` is required.
+Quit and reopen Codex Desktop after enabling shared mode or changing models; native ChatGPT and existing Ollama models remain available alongside entries labeled `[Model Name] (Openrouter)`. To undo the desktop routing, run `bobocodexultra off` and reopen Codex. The wizard does not open Codex, read your saved key, or take over unrelated config settings. No `sudo` is required.
 
 ### Manual setup and later changes
 
@@ -74,7 +74,7 @@ default_subagent_reasoning_effort = "high"
 
 Leave `default_subagent_model` unset if you prefer Codex's own default. An explicit model chosen when spawning a child takes precedence. Do not paste the example model ID blindly: choose a model you have access to, and remember that a model shown in the selector is not a guarantee of tool compatibility. Do not create a second `[agents]` table or overwrite existing user settings. Keep provider and authentication settings in the user-level configuration rather than a project's `.codex/config.toml`.
 
-Reopen Codex, choose a `(BCU)` model, and try a small, read-only task asking Codex to delegate two independent checks to subagents and combine their findings. Then repeat with a native model if you want to verify both routes. Delegation still depends on the task's instructions and the selected model's tool behavior. As an **optional billed** CLI-only check, `bobocodexultra codex smoke --agents` exercises the separate OpenRouter CLI profile; it does not validate every Codex Desktop workflow. See the [official Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference#configtoml) and [subagent guide](https://learn.chatgpt.com/docs/agent-configuration/subagents#custom-agents) for current settings and custom roles.
+Reopen Codex, choose an `(Openrouter)` model, and try a small, read-only task asking Codex to delegate two independent checks to subagents and combine their findings. Then repeat with a native model if you want to verify both routes. Delegation still depends on the task's instructions and the selected model's tool behavior. As an **optional billed** CLI-only check, `bobocodexultra codex smoke --agents` exercises the separate OpenRouter CLI profile; it does not validate every Codex Desktop workflow. See the [official Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference#configtoml) and [subagent guide](https://learn.chatgpt.com/docs/agent-configuration/subagents#custom-agents) for current settings and custom roles.
 
 ## Control reasoning difficulty
 
@@ -89,7 +89,7 @@ bobocodexultra doctor                                  # Inspect config and poss
 
 Relaunch Codex to refresh the selector. A user-level `model_reasoning_effort` or a task's explicit effort may override the catalog default; `doctor` displays a global effort if present. The router forwards low/medium/high on BCU requests but caps incoming `xhigh`, `max`, or `ultra` to `high` for its OpenRouter route. Provider support varies, so test a short task when changing effort; an upstream model can reject an unsupported value. BCU never rewrites native model entries to force these options.
 
-If a `(BCU)` model in the Codex Desktop selector shows only **High** and will not let you choose Low or Medium, an older BCU-generated catalog may still advertise just one level. Run `bobocodexultra doctor` to check **GUI THINKING**, then `bobocodexultra model sync` to regenerate the catalog safely. Fully quit and reopen Codex Desktop; its catalog is loaded at startup, so an already-open task may still show the old choices. New BCU installations upgrade checksum-verified older catalogs automatically; files modified outside BCU are never silently replaced. This changes only BCU entries, not native/Ollama capabilities or your API key.
+If an `(Openrouter)` model in the Codex Desktop selector shows only **High** and will not let you choose Low or Medium, an older BCU-generated catalog may still advertise just one level. Run `bobocodexultra doctor` to check **GUI THINKING**, then `bobocodexultra model sync` to regenerate the catalog safely. Fully quit and reopen Codex Desktop; its catalog is loaded at startup, so an already-open task may still show the old choices. New BCU installations upgrade checksum-verified older catalogs automatically; files modified outside BCU are never silently replaced. This changes only BCU entries, not native/Ollama capabilities or your API key.
 
 ## macOS menu bar
 
@@ -120,11 +120,11 @@ bobocodexultra pong     # Offline terminal Pong against the CPU
 bobocodexultra doom     # Six-stage terminal maze shooter
 ```
 
-Quit and reopen Codex after enabling/disabling shared mode or changing selected models. Codex loads its catalog at startup; existing tasks may keep earlier provider settings. BCU preserves the native default when enabling shared mode. Pick any native, Ollama or `(BCU)` model in the desktop selector.
+Quit and reopen Codex after enabling/disabling shared mode or changing selected models. Codex loads its catalog at startup; existing tasks may keep earlier provider settings. BCU preserves the native default when enabling shared mode. Pick any native, Ollama or `(Openrouter)` model in the desktop selector.
 
 `on` starts a per-user macOS LaunchAgent, which restarts the router after a crash and starts it at login. No root or sudo is required. `off` restores the previous endpoint/catalog/provider and retains unrelated settings changed afterward. Recovery backups are retained. The listener remains available for already-open tasks until they reload; turning off desktop routing does not delete credentials, selections, or usage data.
 
-The model TUI supports `/` search, `S` sort, arrows or J/K scrolling, Page Up/Down, Space multi-select, `D` default, `R` cycle low/medium/high reasoning, `I` details, Enter save, and Q cancel. Changes are staged until saved. Labels are exactly `[Model Name] (BCU)`, for example `Grok 4.6 (BCU)`. Provider prefixes are removed from labels; request model IDs remain unchanged.
+The model TUI supports `/` search, `S` sort, arrows or J/K scrolling, Page Up/Down, Space multi-select, `D` default, `R` cycle low/medium/high reasoning, `I` details, Enter save, and Q cancel. Changes are staged until saved. Labels are exactly `[Model Name] (Openrouter)`, for example `Grok 4.6 (Openrouter)`. Provider prefixes are removed from labels; request model IDs remain unchanged.
 
 The one-time login is interactive and uses a hidden Keychain prompt. For machines already signed in with BCU, `bobocodexultra on` is enough to activate shared mode. `bobocodexultra login` can also replace the saved key. Use `bobocodexultra auth login --no-desktop` if you only want to update the key.
 

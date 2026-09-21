@@ -4,7 +4,7 @@ Run `bobocodexultra doctor` first. It reports the desktop mode, local router hea
 
 ## BCU models do not appear
 
-Run `bobocodexultra on` and `bobocodexultra sync`, then quit and reopen Codex. The app loads its model catalog at startup. If the model is still absent, use `bobocodexultra models` to check whether it is selected. The selector label ends in `(BCU)`; the internal model ID retains its provider slug.
+Run `bobocodexultra on` and `bobocodexultra sync`, then quit and reopen Codex. The app loads its model catalog at startup. If the model is still absent, use `bobocodexultra models` to check whether it is selected. The selector label ends in `(Openrouter)`; the internal model ID retains its provider slug.
 
 ## ChatGPT models disappear or requests take the wrong route
 

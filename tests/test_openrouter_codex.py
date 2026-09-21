@@ -33,8 +33,8 @@ class OpenRouterCodexTests(unittest.TestCase):
         config = tomllib.loads(profile)
         catalog = json.loads((self.home / "openrouter-codex-models.json").read_text())
         self.assertEqual(len(catalog["models"]), 5)
-        self.assertTrue(all(m["display_name"].endswith(" (BCU)") for m in catalog["models"]))
-        self.assertTrue(all(m["display_name"].count("(BCU)") == 1 for m in catalog["models"]))
+        self.assertTrue(all(m["display_name"].endswith(" (Openrouter)") for m in catalog["models"]))
+        self.assertTrue(all(m["display_name"].count("(Openrouter)") == 1 for m in catalog["models"]))
         self.assertEqual(config["model_provider"], "openrouter")
         self.assertEqual(config["model_providers"]["openrouter"]["auth"]["command"], "/usr/bin/security")
         self.assertNotIn("sk-or-", profile)
@@ -81,10 +81,10 @@ class OpenRouterCodexTests(unittest.TestCase):
             self.assertEqual(config["model"], "deepseek/deepseek-v4.1-flash")
             self.assertEqual(profile["model"], config["model"])
             self.assertEqual([m["slug"] for m in catalog["models"]], [config["model"]])
-            self.assertEqual(catalog["models"][0]["display_name"], "DeepSeek V4.1 Flash (BCU)")
+            self.assertEqual(catalog["models"][0]["display_name"], "DeepSeek V4.1 Flash (Openrouter)")
             tool["update_selection"](tool["selection"]())
             self.assertEqual(json.loads((self.home / "openrouter-codex-models.json").read_text())["models"][0]["display_name"],
-                             "DeepSeek V4.1 Flash (BCU)")
+                             "DeepSeek V4.1 Flash (Openrouter)")
             tool["desktop_off"]()
         self.assertEqual((self.home / "config.toml").read_bytes(), original)
 
@@ -149,7 +149,7 @@ class OpenRouterCodexTests(unittest.TestCase):
             tool["update_selection"](tool["selection"]())
             self.assertEqual(config.read_bytes(), edited)
             catalog = json.loads((self.home / "openrouter-codex-models.json").read_text())
-            self.assertTrue(all(m["display_name"].endswith(" (BCU)") for m in catalog["models"]))
+            self.assertTrue(all(m["display_name"].endswith(" (Openrouter)") for m in catalog["models"]))
             with self.assertRaises(tool["SetupError"]):
                 tool["desktop_off"]()
 
@@ -372,7 +372,8 @@ class OpenRouterCodexTests(unittest.TestCase):
                                        "context_length": 100000, "architecture": {"input_modalities": ["text"]}})
         self.assertNotIn("\033", record["name"])
         self.assertNotIn("\n", record["name"])
-        self.assertEqual(tool["selector_name"]("OpenRouter · Example (BCU) (BCU)"), "Example (BCU)")
+        self.assertEqual(tool["selector_name"]("OpenRouter · Example (BCU) (BCU)"), "Example (Openrouter)")
+        self.assertEqual(tool["selector_name"]("x.ai: Grok 4.6 (Openrouter)"), "Grok 4.6 (Openrouter)")
 
     def test_add_default_remove_keep_dynamic_selector_markers(self):
         new = {"id": "deepseek/deepseek-v4.1-flash", "name": "DeepSeek V4.1 Flash",
@@ -390,8 +391,8 @@ class OpenRouterCodexTests(unittest.TestCase):
             catalog = json.loads((self.home / "openrouter-codex-models.json").read_text())["models"]
             self.assertEqual(selected["default"], new["id"])
             self.assertEqual([m["slug"] for m in catalog], [m["id"] for m in selected["models"]])
-            self.assertTrue(all(m["display_name"].endswith(" (BCU)") for m in catalog))
-            self.assertEqual(catalog[-1]["display_name"], "DeepSeek V4.1 Flash (BCU)")
+            self.assertTrue(all(m["display_name"].endswith(" (Openrouter)") for m in catalog))
+            self.assertEqual(catalog[-1]["display_name"], "DeepSeek V4.1 Flash (Openrouter)")
 
     def test_native_reset_preserves_unrelated_changes_and_removes_bcu(self):
         original = (b'model = "gpt-6-astra"\nmodel_reasoning_effort = "xhigh"\n'

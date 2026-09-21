@@ -222,7 +222,7 @@ class ConfigTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name)
         bcu.write_json(self.home / "native.json", {"models": [{"slug": "gpt-native"}, {"slug": "ollama:cloud"}]})
-        bcu.write_json(self.home / "openrouter-codex-models.json", {"models": [{"slug": "author/model", "display_name": "Model (BCU)"}]})
+        bcu.write_json(self.home / "openrouter-codex-models.json", {"models": [{"slug": "author/model", "display_name": "Model (Openrouter)"}]})
         self.original = (f'model = "gpt-native"\nmodel_catalog_json = "{self.home / "native.json"}"\n'
                          'openai_base_url = "http://127.0.0.1:11434/api/codex/v1"\nservice_tier = "default"\n\n[desktop]\nappearance = "dark"\n').encode()
         (self.home / "config.toml").write_bytes(self.original)

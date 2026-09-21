@@ -358,12 +358,13 @@ def safe_text(value: object, limit: int = 100) -> str:
 
 def selector_name(name: str) -> str:
     """Mark only the visible label, never the OpenRouter model ID."""
-    clean = re.sub(r"^(?:OpenRouter\s*·\s*)|(?:\s*\(BCU\))+$", "", safe_text(name)).strip()
+    clean = re.sub(r"^OpenRouter\s*·\s*", "", safe_text(name)).strip()
+    clean = re.sub(r"(?:\s*\((?:BCU|Openrouter)\))+$", "", clean, flags=re.IGNORECASE).strip()
     # OpenRouter display names use "Provider: Model". Require whitespace
     # after the colon so model qualifiers such as "Qwen3:30b" stay intact.
     clean = re.sub(r"^[^:]+:\s+", "", clean, count=1).strip()
     clean = clean[:1].upper() + clean[1:]
-    return f"{clean} (BCU)"
+    return f"{clean} (Openrouter)"
 
 
 class SetupError(Exception):
@@ -1850,7 +1851,7 @@ def docs(topic: str) -> None:
             ("model add [author/model-id]", "Open the TUI, or add one exact ID noninteractively."),
             ("model remove [author/model-id]", "Open the TUI, or remove one exact ID."),
             ("model default [author/model-id]", "Open the TUI, or choose one exact default ID."),
-            ("model sync", "Regenerate selector labels; selected models end with (BCU)."),
+            ("model sync", "Regenerate selector labels; selected models end with (Openrouter)."),
             ("reasoning [low|medium|high] [--model ID]", "Show or set a BCU model's default reasoning and selector levels."),
         ],
         "agents": [
@@ -1980,7 +1981,7 @@ def main() -> None:
     model_sub = sub.add_parser("model", help="Choose models shown in Codex").add_subparsers(dest="action")
     model_sub.add_parser("manage", help="Full-screen search, sort, scroll, and multi-select TUI")
     model_sub.add_parser("list", help="Show selected models and default")
-    model_sub.add_parser("sync", help="Regenerate selected model labels, including the (BCU) marker")
+    model_sub.add_parser("sync", help="Regenerate selected model labels, including the (Openrouter) marker")
     search_parser = model_sub.add_parser("search", help="Search OpenRouter's tool-capable models")
     search_parser.add_argument("query", nargs="?", default="")
     select_parser = model_sub.add_parser("select", help="Open full-screen manager with optional starting search")
