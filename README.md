@@ -1,6 +1,6 @@
 # Bobo Codex Ultra — BCU
 
-![BCU Inter B in a square icon](assets/BCU-icon.png)
+<img src="assets/BCU-icon.png" alt="BCU Inter B in a square icon" width="112">
 
 BCU adds OpenRouter models alongside native ChatGPT and Ollama models in the **Codex desktop app**. It runs a local routing service and keeps Codex's built-in OpenAI provider and existing ChatGPT sign-in. It does not patch the signed desktop application.
 
