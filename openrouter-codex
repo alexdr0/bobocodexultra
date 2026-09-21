@@ -1,0 +1,1582 @@
+#!/usr/bin/env python3
+"""Keychain-backed OpenRouter profile and reversible Codex desktop selector mode.
+
+No API key is accepted as a command-line argument, environment variable, or file.
+The macOS `security` command prompts for it and stores it in the login Keychain.
+"""
+
+from __future__ import annotations
+
+import argparse
+from contextlib import contextmanager
+import copy
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import textwrap
+import time
+import tomllib
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+
+SERVICE = "com.codex.openrouter-models"
+ACCOUNT = "openrouter-api-key"
+DEFAULT_MODEL = "anthropic/claude-opus-5"
+MODELS = (
+    ("anthropic/claude-fable-5.1", "OpenRouter · Claude Fable 5.1", 1_000_000, True),
+    ("anthropic/claude-opus-5", "OpenRouter · Claude Opus 5", 1_000_000, True),
+    ("openai/gpt-5.6-sol", "OpenRouter · GPT-5.6 Sol", 1_050_000, True),
+    ("moonshotai/kimi-k3", "OpenRouter · Kimi K3", 1_048_576, True),
+    ("z-ai/glm-5.3", "OpenRouter · GLM 5.3", 1_310_720, False),
+)
+SLUGS = tuple(row[0] for row in MODELS)
+MODEL_ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._+-]*/[a-zA-Z0-9][a-zA-Z0-9._:+-]*$")
+MANAGED_KEYS = ("model", "model_provider", "model_catalog_json", "model_reasoning_effort")
+START_MARKER = "# BEGIN openrouter-codex provider (managed; do not edit)"
+END_MARKER = "# END openrouter-codex provider"
+BASE_INSTRUCTIONS = (
+    "You are Codex, a coding agent. Follow the current user and developer instructions. "
+    "Use available tools to inspect, edit, and verify work when authorized. Respect the "
+    "sandbox and approval settings. Delegate to subagents when explicitly requested or "
+    "required by applicable instructions; coordinate their results before answering. "
+    "Never reveal credentials or include them in files, logs, or replies."
+)
+
+
+class TerminalUI:
+    """A quiet plain-text UI for pipes, and a neon one for interactive terminals."""
+
+    def __init__(self) -> None:
+        self.color = sys.stdout.isatty() and not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb"
+        self.motion = (self.color and sys.stderr.isatty() and not os.environ.get("CI")
+                       and not os.environ.get("BOBOCODEXULTRA_NO_ANIM"))
+
+    def paint(self, value: str, shade: str) -> str:
+        if not self.color:
+            return value
+        colors = {"pink": "\033[38;2;255;93;211m", "violet": "\033[38;2;163;108;255m",
+                  "cyan": "\033[38;2;73;224;241m", "mint": "\033[38;2;105;255;180m",
+                  "amber": "\033[38;2;255;205;100m", "dim": "\033[2m"}
+        return colors[shade] + value + "\033[0m"
+
+    def heading(self, subtitle: str) -> None:
+        logo = "✦  BOBO / CODEX ULTRA"
+        if self.motion:
+            for index, character in enumerate(logo):
+                sys.stdout.write(self.paint(character, ("pink", "violet", "cyan")[index % 3]))
+                sys.stdout.flush()
+                time.sleep(0.006)
+            print()
+        else:
+            print(self.paint(logo, "pink"))
+        print(self.paint("   ╰─ " + subtitle, "cyan"))
+        print(self.paint("   " + "━" * 39, "violet"))
+
+    def section(self, name: str) -> None:
+        print("\n" + self.paint("◆ " + name.upper(), "violet"))
+
+    def row(self, label: str, detail: str, shade: str = "cyan") -> None:
+        print("  " + self.paint(f"{label:<17}", shade) + detail)
+
+    def done(self, message: str) -> None:
+        print(self.paint("✓ ", "mint") + message)
+
+    @contextmanager
+    def spinner(self, message: str):
+        if not self.motion:
+            yield
+            return
+        stopped = threading.Event()
+
+        def animate() -> None:
+            frames = "◐◓◑◒"
+            index = 0
+            while not stopped.wait(0.1):
+                sys.stderr.write("\r" + self.paint(frames[index % len(frames)], "pink") + " " + message)
+                sys.stderr.flush()
+                index += 1
+            sys.stderr.write("\r" + " " * (len(message) + 4) + "\r")
+            sys.stderr.flush()
+
+        worker = threading.Thread(target=animate, daemon=True)
+        worker.start()
+        try:
+            yield
+        finally:
+            stopped.set()
+            worker.join(timeout=1)
+
+
+UI = TerminalUI()
+
+
+def router_module():
+    """Load the adjacent installed routing service without changing import paths."""
+    if sys.version_info < (3, 14):
+        raise SetupError("BCU shared desktop routing requires Python 3.14 or newer.")
+    if "bcu_router" not in sys.modules:
+        path = Path(__file__).resolve().with_name("bcu_router.py")
+        if not path.is_file():
+            raise SetupError("BCU router module is missing. Reinstall from the complete BCU folder.")
+        spec = importlib.util.spec_from_file_location("bcu_router", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["bcu_router"] = module
+        spec.loader.exec_module(module)
+    return sys.modules["bcu_router"]
+
+
+def mixed_controller():
+    return router_module().Controller(paths()["home"])
+
+
+def refresh_mixed_catalog() -> None:
+    control = mixed_controller()
+    if control.state.exists():
+        with control.locked():
+            control.refresh()
+
+
+def mixed_on() -> None:
+    ensure_macos()
+    if sys.version_info < (3, 14):
+        raise SetupError("The BCU router needs Python 3.14+ for Codex's zstd request compression.")
+    if not key_exists():
+        raise SetupError("Run `bobocodexultra login` to save your OpenRouter key first.")
+    # Migrate the earlier global-provider implementation through its safe restore.
+    if paths()["state"].exists():
+        native_reset()
+    prepare()
+    install()
+    mixed_controller().enable()
+    UI.done("Shared desktop mode is on: native ChatGPT + Ollama + BCU models.")
+    UI.row("NEXT", "Quit and reopen Codex once to load the combined selector.")
+
+
+def mixed_off() -> None:
+    control = mixed_controller()
+    control.disable()
+    if paths()["state"].exists():
+        native_reset()
+    UI.done("BCU desktop routing is off. Your previous native/Ollama setup is restored.")
+    UI.row("NEXT", "Quit and reopen Codex. Already-open tasks retain their previous endpoint until then.")
+
+
+def doctor() -> None:
+    control = mixed_controller()
+    runtime = router_module().health()
+    parsed = tomllib.loads(paths()["config"].read_text()) if paths()["config"].exists() else {}
+    UI.section("Desktop routing")
+    UI.row("MODE", "shared" if control.state.exists() else "native / BCU off")
+    UI.row("SERVICE", "healthy" if runtime.get("home") == str(paths()["home"]) else "not running")
+    UI.row("PROVIDER", parsed.get("model_provider", "openai"))
+    UI.row("ENDPOINT", parsed.get("openai_base_url", "OpenAI default"))
+    UI.row("KEYCHAIN", "ready" if key_exists() else "missing / locked")
+    if control.catalog.exists():
+        UI.row("CATALOG", f"{len(json.loads(control.catalog.read_text())['models'])} combined models")
+    if runtime:
+        UI.row("REQUESTS", json.dumps(runtime.get("counts", {})))
+    UI.row("RECOVERY", "`bobocodexultra on` repairs a stopped service; `off` restores native desktop settings.")
+
+
+def desktop_home() -> None:
+    control = mixed_controller()
+    runtime = router_module().health()
+    UI.row("DESKTOP", "Shared models enabled" if control.state.exists() else "Native / BCU off", "mint")
+    UI.row("ROUTER", "Running locally" if runtime.get("home") == str(paths()["home"]) else "Stopped")
+    UI.section("Everyday commands")
+    for command, purpose in (("login", "Save your OpenRouter key securely"),
+                             ("on", "Use ChatGPT, Ollama and BCU models side by side"),
+                             ("models", "Search and choose BCU models"),
+                             ("off", "Return to your previous desktop setup"),
+                             ("doctor", "Check and troubleshoot desktop routing"),
+                             ("docs", "Read the full command guide")):
+        UI.row(command, purpose)
+    UI.row("RELOAD", "Quit and reopen Codex after changing modes or model selections.", "amber")
+
+
+def safe_text(value: object, limit: int = 100) -> str:
+    """Prevent public model metadata from writing control sequences to the terminal."""
+    if not isinstance(value, str):
+        return ""
+    return "".join(char for char in value if char.isprintable() and char not in "\u202a\u202b\u202c\u202d\u202e").strip()[:limit]
+
+
+def selector_name(name: str) -> str:
+    """Mark only the visible label, never the OpenRouter model ID."""
+    clean = re.sub(r"^(?:OpenRouter\s*·\s*)|(?:\s*\(BCU\))+$", "", safe_text(name)).strip()
+    # OpenRouter display names use "Provider: Model". Require whitespace
+    # after the colon so model qualifiers such as "Qwen3:30b" stay intact.
+    clean = re.sub(r"^[^:]+:\s+", "", clean, count=1).strip()
+    clean = clean[:1].upper() + clean[1:]
+    return f"{clean} (BCU)"
+
+
+class SetupError(Exception):
+    pass
+
+
+def paths() -> dict[str, Path]:
+    home = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser().resolve()
+    return {
+        "home": home,
+        "config": home / "config.toml",
+        "profile": home / "openrouter.config.toml",
+        "catalog": home / "openrouter-codex-models.json",
+        "state": home / "openrouter-codex-state.json",
+        "selection": home / "openrouter-codex-selection.json",
+        "usage_cache": home / "openrouter-codex-usage-prices.json",
+        "backups": home / "openrouter-codex-backups",
+    }
+
+
+def ensure_macos() -> None:
+    if sys.platform != "darwin" or not Path("/usr/bin/security").exists():
+        raise SetupError("This tool requires macOS Keychain (/usr/bin/security).")
+
+
+def key_exists() -> bool:
+    ensure_macos()
+    result = subprocess.run(
+        ["/usr/bin/security", "find-generic-password", "-a", ACCOUNT, "-s", SERVICE],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def save_key() -> None:
+    ensure_macos()
+    if not sys.stdin.isatty() or not sys.stderr.isatty():
+        raise SetupError("Run `bobocodexultra auth login` in an interactive Terminal; the key prompt needs a TTY.")
+    UI.section("Keychain handoff")
+    UI.row("INPUT", "macOS securely prompts for the OpenRouter key", "amber")
+    UI.row("STORAGE", "login Keychain; never in arguments, environment, or config", "mint")
+    # Per `security help add-generic-password`, a terminal -w prompts securely.
+    # Never append a value to -w or use -A (allow every app).
+    result = subprocess.run(
+        [
+            "/usr/bin/security", "add-generic-password", "-U", "-a", ACCOUNT,
+            "-s", SERVICE, "-l", "Codex OpenRouter API key", "-w",
+        ],
+        check=False,
+    )
+    if result.returncode:
+        raise SetupError("Keychain did not store the key; configuration was not activated.")
+    if not key_exists():
+        raise SetupError("Keychain item could not be found after entry.")
+    UI.done("Key stored in macOS Keychain. This tool did not read its value.")
+
+
+def sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def write_if_new_or_equal(path: Path, data: bytes, refresh: bool = False) -> None:
+    if path.exists():
+        if path.read_bytes() != data:
+            if not refresh:
+                raise SetupError(f"{path} differs; use `auth prepare --refresh` to back up and replace it.")
+            backup = path.with_name(f"{path.name}.backup-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}")
+            atomic_write(backup, path.read_bytes())
+            atomic_write(path, data)
+            print(f"Saved prior version: {backup}")
+        return
+    atomic_write(path, data)
+
+
+def source_template(home: Path) -> dict:
+    candidates = (home / "ollama-launch-models.json", home / "model.json")
+    for path in candidates:
+        if path.is_file():
+            try:
+                models = json.loads(path.read_text()).get("models", [])
+                for item in models:
+                    if item.get("slug") == "kimi-k3:cloud":
+                        return copy.deepcopy(item)
+            except (OSError, ValueError, AttributeError):
+                pass
+    # The fields below are the conservative model-preset subset used by Codex.
+    return {
+        "slug": "", "display_name": "", "description": "", "visibility": "list",
+        "supported_in_api": True, "context_window": 200_000,
+        "default_reasoning_level": "high", "supported_reasoning_levels": [],
+        "supports_parallel_tool_calls": True, "input_modalities": ["text"],
+        "shell_type": "unified_exec", "apply_patch_tool_type": None,
+            "base_instructions": "You are Codex, a coding agent. Work carefully with the user's files and tools.",
+    }
+
+
+def initial_selection() -> dict:
+    return {"default": DEFAULT_MODEL, "models": [
+        {"id": slug, "name": display.removeprefix("OpenRouter · "),
+         "context_length": context, "images": images} for slug, display, context, images in MODELS
+    ]}
+
+
+def selection() -> dict:
+    path = paths()["selection"]
+    value = json.loads(path.read_text()) if path.exists() else initial_selection()
+    models = value.get("models")
+    if not isinstance(models, list) or not models or any(
+        not isinstance(m, dict) or not isinstance(m.get("id"), str)
+        or not MODEL_ID.fullmatch(m["id"])
+        or not isinstance(m.get("name"), str)
+        or not isinstance(m.get("context_length"), int) or m["context_length"] < 8192
+        or not isinstance(m.get("images"), bool) for m in models
+    ):
+        raise SetupError(f"Invalid model selection in {path}")
+    ids = [m["id"] for m in models]
+    if len(set(ids)) != len(ids) or value.get("default") not in ids:
+        raise SetupError(f"Invalid or duplicate models/default in {path}")
+    return value
+
+
+def catalog_bytes(home: Path, selected: dict | None = None) -> bytes:
+    selected = selected or selection()
+    template = source_template(home)
+    models = []
+    for priority, chosen in enumerate(selected["models"]):
+        slug, context, images = chosen["id"], chosen["context_length"], chosen["images"]
+        item = copy.deepcopy(template)
+        item.update({
+            "slug": slug,
+            "display_name": selector_name(chosen["name"]),
+            "description": "OpenRouter Responses API model; verify tool behavior before sensitive work.",
+            "context_window": context,
+            "max_context_window": context,
+            "default_reasoning_level": "high",
+            "supported_reasoning_levels": [
+                {"effort": "high", "description": "High reasoning for agentic work"}
+            ],
+            "input_modalities": ["text", "image"] if images else ["text"],
+            "visibility": "list",
+            "supported_in_api": True,
+            "supports_parallel_tool_calls": True,
+            "supports_reasoning_summaries": False,
+            "supports_reasoning_summary_parameter": False,
+            "experimental_supported_tools": [],
+            "additional_speed_tiers": [],
+            "service_tiers": [],
+            "priority": priority,
+        })
+        item["base_instructions"] = BASE_INSTRUCTIONS
+        models.append(item)
+    return (json.dumps({"models": models}, indent=2, ensure_ascii=False) + "\n").encode()
+
+
+def provider_toml() -> str:
+    # No key material is embedded in this block. Codex consumes stdout from -w.
+    return (
+        "[model_providers.openrouter]\n"
+        'name = "OpenRouter"\n'
+        'base_url = "https://openrouter.ai/api/v1"\n'
+        'wire_api = "responses"\n'
+        "supports_websockets = false\n\n"
+        "[model_providers.openrouter.auth]\n"
+        'command = "/usr/bin/security"\n'
+        f"args = {json.dumps(['find-generic-password', '-a', ACCOUNT, '-s', SERVICE, '-w'])}\n"
+        "refresh_interval_ms = 0\n"
+    )
+
+
+def profile_bytes(catalog: Path, default: str = DEFAULT_MODEL) -> bytes:
+    return (
+        f"# OpenRouter profile created by openrouter-codex. No credentials here.\n"
+        f"model = {json.dumps(default)}\n"
+        'model_provider = "openrouter"\n'
+        f"model_catalog_json = {json.dumps(str(catalog))}\n"
+        'model_reasoning_effort = "high"\n'
+        'service_tier = "default"\n\n'
+        "[agents]\n"
+        "enabled = true\n"
+        "max_concurrent_threads_per_session = 2\n\n"
+        + provider_toml()
+    ).encode()
+
+
+def prepare(refresh: bool = False) -> dict[str, Path]:
+    ensure_macos()
+    p = paths()
+    p["home"].mkdir(mode=0o700, parents=True, exist_ok=True)
+    chosen = selection()
+    catalog = catalog_bytes(p["home"], chosen)
+    profile = profile_bytes(p["catalog"], chosen["default"])
+    tomllib.loads(profile.decode())
+    if not refresh:
+        verify_managed(chosen, p)
+    write_if_new_or_equal(p["catalog"], catalog, refresh)
+    write_if_new_or_equal(p["profile"], profile, refresh)
+    chosen.update(catalog_sha256=sha(catalog), profile_sha256=sha(profile))
+    atomic_write(p["selection"], (json.dumps(chosen, indent=2) + "\n").encode())
+    UI.done(f"Codex profile ready: {p['profile']}")
+    UI.done(f"{len(chosen['models'])}-model catalog ready: {p['catalog']}")
+    return p
+
+
+def verify_managed(chosen: dict, p: dict[str, Path]) -> None:
+    for label in ("catalog", "profile"):
+        expected = chosen.get(label + "_sha256")
+        if expected and (not p[label].exists() or sha(p[label].read_bytes()) != expected):
+            raise SetupError(f"{p[label]} changed outside this tool; refusing to overwrite it.")
+
+
+def openrouter_models(query: str = "", limit: int | None = 100) -> list[dict]:
+    url = "https://openrouter.ai/api/v1/models?" + urllib.parse.urlencode({
+        "sort": "most-popular", "supported_parameters": "tools", "q": query,
+    })
+    try:
+        with UI.spinner("Scanning OpenRouter models"):
+            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "bobocodexultra/1"}), timeout=20) as response:
+                raw = response.read(8_000_001)
+                if len(raw) > 8_000_000:
+                    raise SetupError("OpenRouter catalog response is unexpectedly large.")
+                models = json.loads(raw)["data"]
+    except (urllib.error.URLError, KeyError, ValueError) as exc:
+        raise SetupError(f"Could not load OpenRouter models: {exc}") from exc
+    return [m for m in models if isinstance(m, dict) and isinstance(m.get("id"), str)
+            and MODEL_ID.fullmatch(m["id"]) and "tools" in (m.get("supported_parameters") or [])
+            and isinstance(m.get("context_length"), int) and m["context_length"] >= 8192][:limit]
+
+
+def openrouter_pricing_catalog() -> list[dict]:
+    url = "https://openrouter.ai/api/v1/models?" + urllib.parse.urlencode({"limit": 1000, "output_modalities": "text"})
+    try:
+        with UI.spinner("Loading OpenRouter pricing catalog"):
+            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "bobocodexultra/1"}), timeout=20) as response:
+                raw = response.read(12_000_001)
+                if len(raw) > 12_000_000:
+                    raise SetupError("OpenRouter pricing response is unexpectedly large.")
+                models = json.loads(raw)["data"]
+    except (urllib.error.URLError, KeyError, ValueError) as exc:
+        raise SetupError(f"Could not load OpenRouter pricing: {exc}") from exc
+    return [m for m in models if isinstance(m, dict) and isinstance(m.get("id"), str)
+            and MODEL_ID.fullmatch(m["id"])]
+
+
+def model_record(model: dict) -> dict:
+    context = model.get("context_length")
+    if not isinstance(context, int) or context < 8192:
+        raise SetupError(f"{model['id']} does not advertise a usable context length.")
+    return {"id": model["id"], "name": safe_text(model.get("name")) or model["id"],
+            "context_length": context,
+            "images": "image" in (model.get("architecture") or {}).get("input_modalities", [])}
+
+
+def model_price(model: dict, key: str) -> Decimal | None:
+    """OpenRouter's base token price, converted to approximate USD per million."""
+    raw = (model.get("pricing") or {}).get(key)
+    try:
+        value = Decimal(str(raw)) * 1_000_000
+        return value if value.is_finite() and value >= 0 else None
+    except (InvalidOperation, TypeError):
+        return None
+
+
+def manager_catalog(chosen: dict) -> list[dict]:
+    available = openrouter_models("", None)
+    ids = {m["id"] for m in available}
+    for record in chosen["models"]:
+        if record["id"] not in ids:
+            available.append({
+                "id": record["id"], "name": record["name"],
+                "context_length": record["context_length"],
+                "architecture": {"input_modalities": ["text", "image"] if record["images"] else ["text"]},
+                "supported_parameters": [], "description": "Previously selected; not currently in the tool-capable listing.",
+                "_unavailable": True,
+            })
+    for rank, model in enumerate(available):
+        model["_rank"] = rank
+    return available
+
+
+SORT_MODES = ("popular", "name", "context", "input price", "output price", "selected first")
+
+
+def manager_view(available: list[dict], selected: set[str], query: str, sort_mode: str) -> list[dict]:
+    words = query.casefold().split()
+    visible = [m for m in available if all(
+        word in (m["id"] + " " + safe_text(m.get("name"), 160) + " " +
+                 safe_text(m.get("description"), 200)).casefold() for word in words
+    )]
+    if sort_mode == "name":
+        return sorted(visible, key=lambda m: (safe_text(m.get("name")).casefold(), m["id"]))
+    if sort_mode == "context":
+        return sorted(visible, key=lambda m: (-m.get("context_length", 0), m["_rank"]))
+    if sort_mode in ("input price", "output price"):
+        key = "prompt" if sort_mode == "input price" else "completion"
+        return sorted(visible, key=lambda m: (model_price(m, key) is None,
+                                               model_price(m, key) or Decimal(0), m["_rank"]))
+    if sort_mode == "selected first":
+        return sorted(visible, key=lambda m: (m["id"] not in selected, m["_rank"]))
+    return sorted(visible, key=lambda m: m["_rank"])
+
+
+def manager_result(chosen: dict, selected: set[str], default: str, available: list[dict]) -> dict:
+    if not selected:
+        raise SetupError("Choose at least one model before saving.")
+    by_id = {m["id"]: m for m in available}
+    prior = [m["id"] for m in chosen["models"] if m["id"] in selected]
+    additional = [m["id"] for m in available if m["id"] in selected and m["id"] not in prior]
+    order = prior + additional
+    prior_records = {m["id"]: m for m in chosen["models"]}
+    result = copy.deepcopy(chosen)
+    result["models"] = [copy.deepcopy(prior_records[slug]) if slug in prior_records
+                        else model_record(by_id[slug]) for slug in order]
+    result["default"] = default if default in selected else order[0]
+    return result
+
+
+def model_manager(chosen: dict, query: str = "", sort_mode: str = "popular") -> None:
+    """Full-screen, staged multi-model picker. Escape/cancel writes nothing."""
+    if not sys.stdin.isatty() or not sys.stdout.isatty() or os.environ.get("TERM") == "dumb":
+        raise SetupError("The model manager needs an interactive terminal (TERM=xterm-256color or similar). "
+                         "For scripts, use `model add author/model-id` or `model remove author/model-id`.")
+    try:
+        import curses
+    except ImportError as exc:
+        raise SetupError("This Python installation has no curses support.") from exc
+
+    UI.row("LOADING", "OpenRouter's tool-capable model catalog; no model call or charge.", "amber")
+    available = manager_catalog(chosen)
+    if not available:
+        raise SetupError("OpenRouter returned no tool-capable models.")
+    selected = {m["id"] for m in chosen["models"]}
+    dirty_config = False
+    p = paths()
+    starting_selection = sha(p["selection"].read_bytes()) if p["selection"].exists() else None
+    if p["state"].exists():
+        state = json.loads(p["state"].read_text())
+        dirty_config = not p["config"].exists() or sha(p["config"].read_bytes()) != state["active_sha256"]
+
+    def screen(stdscr):
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        stdscr.keypad(True)
+        if UI.color and curses.has_colors():
+            curses.start_color()
+            try:
+                curses.use_default_colors()
+            except curses.error:
+                pass
+            for number, foreground in ((1, curses.COLOR_MAGENTA), (2, curses.COLOR_CYAN),
+                                       (3, curses.COLOR_GREEN), (4, curses.COLOR_YELLOW)):
+                try:
+                    curses.init_pair(number, foreground, -1)
+                except curses.error:
+                    curses.init_pair(number, foreground, curses.COLOR_BLACK)
+
+        def color(number: int, extra: int = 0) -> int:
+            return (curses.color_pair(number) if UI.color and curses.has_colors() else 0) | extra
+
+        def draw(y: int, x: int, value: str, width: int, attribute: int = 0) -> None:
+            height, columns = stdscr.getmaxyx()
+            if y < 0 or y >= height or x < 0 or x >= columns - 1:
+                return
+            try:
+                stdscr.addnstr(y, x, value, max(0, min(width, columns - x - 1)), attribute)
+            except curses.error:
+                pass
+
+        staged = set(selected)
+        default = chosen["default"]
+        search = safe_text(query, 100)
+        editing = False
+        help_open = False
+        detail_open = False
+        order = sort_mode
+        cursor = 0
+        scroll = 0
+        message = "Space toggles models; Enter saves; Q cancels without changes."
+
+        while True:
+            height, columns = stdscr.getmaxyx()
+            stdscr.erase()
+            if height < 17 or columns < 70:
+                draw(1, 2, "Resize the terminal to at least 70 × 17.", columns - 4, color(4))
+                draw(3, 2, "Q or Esc cancels.", columns - 4)
+                stdscr.refresh()
+                key = stdscr.get_wch()
+                if key in ("q", "Q", "\x1b", 27):
+                    return None
+                continue
+
+            if help_open:
+                help_lines = [
+                    "MODEL MANAGER / KEYBOARD GUIDE", "",
+                    "/      Search by name, provider, ID, or description (updates as you type)",
+                    "S      Cycle popular, name, context, price, selected-first sorting",
+                    "↑ ↓    Scroll one model (J/K also work)",
+                    "PgUp/PgDn, G, Shift+G    Jump through long lists",
+                    "Space  Toggle the highlighted model; select as many as you like",
+                    "D      Make the highlighted model your default (selects it too)",
+                    "X      Remove the highlighted model from your selection",
+                    "I/Tab  Open full model details (also useful in narrow terminals)",
+                    "Enter  Save all staged changes to the Codex selector",
+                    "Q/Esc  Cancel without saving", "",
+                    "Only models advertising tool support appear; live Codex compatibility",
+                    "and pricing are not guaranteed. A Codex restart refreshes its selector.",
+                    "", "Press ? or Esc to return.",
+                ]
+                for y, line in enumerate(help_lines, 1):
+                    draw(y, 3, line, columns - 6, color(2 if y == 1 else 0))
+                stdscr.refresh()
+                key = stdscr.get_wch()
+                if key in ("?", "\x1b", 27):
+                    help_open = False
+                continue
+
+            visible = manager_view(available, staged, search, order)
+            cursor = max(0, min(cursor, len(visible) - 1))
+
+            if detail_open and visible:
+                model = visible[cursor]
+                input_price, output_price = model_price(model, "prompt"), model_price(model, "completion")
+                detail_lines = [
+                    "MODEL DETAILS / " + safe_text(model.get("name")), "",
+                    "ID: " + model["id"],
+                    "Context: " + str(model.get("context_length") or "unknown") + " tokens",
+                    "Input base price: " + (f"${input_price:,.3f}/M tokens" if input_price is not None else "unknown"),
+                    "Output base price: " + (f"${output_price:,.3f}/M tokens" if output_price is not None else "unknown"),
+                    "Input modalities: " + ", ".join((model.get("architecture") or {}).get("input_modalities") or []),
+                    "Tool calling: " + ("not currently listed" if model.get("_unavailable") else "advertised"),
+                    "Selected: " + ("yes" if model["id"] in staged else "no"),
+                    "Default: " + ("yes" if model["id"] == default else "no"), "",
+                    "ABOUT",
+                    *textwrap.wrap(safe_text(model.get("description"), 600), max(25, columns - 7)),
+                ]
+                draw(0, 2, "✦ BOBO / CODEX ULTRA     MODEL DETAILS", columns - 4, color(1, curses.A_BOLD))
+                for y, line in enumerate(detail_lines, 2):
+                    if y >= height - 3:
+                        break
+                    draw(y, 3, line, columns - 6, color(2 if y in (2, 13) else 0))
+                draw(height - 2, 3, "I / Tab / Esc to return to the model list.", columns - 6, color(4))
+                stdscr.refresh()
+                key = stdscr.get_wch()
+                if key in ("i", "I", "\t", "\x1b", 27):
+                    detail_open = False
+                continue
+
+            page = height - 9
+            scroll = max(0, min(scroll, max(0, len(visible) - page)))
+            if cursor < scroll:
+                scroll = cursor
+            if cursor >= scroll + page:
+                scroll = cursor - page + 1
+            side = columns >= 102
+            list_width = max(42, int(columns * 0.57)) if side else columns - 2
+
+            draw(0, 2, "✦ BOBO / CODEX ULTRA     MODEL MANAGER", columns - 4, color(1, curses.A_BOLD))
+            draw(1, 2, f"{len(visible)}/{len(available)} shown   •   {len(staged)} selected   •   sort: {order}",
+                 columns - 4, color(2))
+            search_label = ("SEARCH › " if editing else "Filter: ") + (search or "all tool-capable models")
+            draw(2, 2, search_label + ("_" if editing else ""), columns - 4, color(4 if editing else 0))
+            draw(3, 1, "─" * (columns - 3), columns - 2, color(1))
+            draw(4, 2, "MODELS   ★ default   ◆ selected   ◇ available", list_width - 3, color(2))
+
+            if not visible:
+                draw(6, 3, "No matches. Backspace to broaden the search.", list_width - 4, color(4))
+            for offset, model in enumerate(visible[scroll:scroll + page]):
+                index = scroll + offset
+                slug = model["id"]
+                badge = "★" if slug == default else ("◆" if slug in staged else "◇")
+                name = safe_text(model.get("name")) or slug
+                unavailable = " [unlisted]" if model.get("_unavailable") else ""
+                line = f"{badge} {name}  ·  {slug}{unavailable}"
+                attr = color(3 if slug in staged else 2)
+                if index == cursor:
+                    attr = color(1, curses.A_REVERSE | curses.A_BOLD)
+                draw(5 + offset, 2, line, list_width - 4, attr)
+
+            if side:
+                divider_x = list_width
+                for y in range(4, height - 4):
+                    draw(y, divider_x, "│", 1, color(1))
+                detail_x, detail_width = divider_x + 2, columns - divider_x - 4
+                draw(4, detail_x, "MODEL DETAILS", detail_width, color(2, curses.A_BOLD))
+                if visible:
+                    model = visible[cursor]
+                    slug = model["id"]
+                    input_price, output_price = model_price(model, "prompt"), model_price(model, "completion")
+                    def price(value):
+                        return f"${value:,.3f}/M tokens" if value is not None else "unknown"
+                    details = [
+                        ("NAME", safe_text(model.get("name"))), ("ID", slug),
+                        ("CONTEXT", f"{model.get('context_length'):,} tokens" if isinstance(model.get("context_length"), int)
+                         else "unknown"),
+                        ("INPUT BASE", price(input_price)), ("OUTPUT BASE", price(output_price)),
+                        ("INPUT", ", ".join((model.get("architecture") or {}).get("input_modalities") or []) or "unknown"),
+                        ("TOOLS", "advertised" if not model.get("_unavailable") else "not currently listed"),
+                        ("STATE", "selected" if slug in staged else "not selected"),
+                    ]
+                    y = 6
+                    for label, value in details:
+                        draw(y, detail_x, label, detail_width, color(4, curses.A_BOLD))
+                        y += 1
+                        for wrapped in textwrap.wrap(safe_text(value, 180), max(12, detail_width - 1))[:2]:
+                            draw(y, detail_x, wrapped, detail_width)
+                            y += 1
+                        y += 1
+                        if y >= height - 10:
+                            break
+                    if y < height - 7:
+                        draw(y, detail_x, "ABOUT", detail_width, color(4, curses.A_BOLD))
+                        for line_number, wrapped in enumerate(textwrap.wrap(safe_text(model.get("description"), 300),
+                                                                          max(12, detail_width - 1))[:height - y - 8], y + 1):
+                            draw(line_number, detail_x, wrapped, detail_width)
+
+            draw(height - 4, 1, "─" * (columns - 3), columns - 2, color(1))
+            draw(height - 3, 2, "SPACE toggle    D default    / search    S sort    I details    ? help", columns - 4, color(2))
+            draw(height - 2, 2, "↑↓/JK scroll    PgUp/PgDn jump    ENTER save    Q cancel", columns - 4, color(3))
+            notice = ("Config edited: desktop off needs a manual merge.  " if dirty_config else "") + message
+            draw(height - 1, 2, notice, columns - 4, color(4))
+            stdscr.refresh()
+
+            key = stdscr.get_wch()
+            if editing:
+                if key in ("\n", "\r", curses.KEY_ENTER, "\x1b", 27):
+                    editing = False
+                elif key in ("\b", "\x7f", curses.KEY_BACKSPACE, 127, 8):
+                    search = search[:-1]
+                    cursor = scroll = 0
+                elif key == "\x15":
+                    search = ""
+                    cursor = scroll = 0
+                elif isinstance(key, str) and key.isprintable() and len(search) < 80:
+                    search += key
+                    cursor = scroll = 0
+                continue
+
+            if key in ("q", "Q", "\x1b", 27):
+                return None
+            if key == "?":
+                help_open = True
+            elif key in ("i", "I", "\t") and visible:
+                detail_open = True
+            elif key == "/":
+                editing = True
+            elif key in ("s", "S"):
+                highlighted = visible[cursor]["id"] if visible else None
+                order = SORT_MODES[(SORT_MODES.index(order) + 1) % len(SORT_MODES)]
+                resorted = manager_view(available, staged, search, order)
+                cursor = next((i for i, model in enumerate(resorted) if model["id"] == highlighted), 0)
+                scroll = max(0, cursor - page // 2)
+            elif key in (curses.KEY_DOWN, "j", "J"):
+                cursor = min(len(visible) - 1, cursor + 1)
+            elif key in (curses.KEY_UP, "k", "K"):
+                cursor = max(0, cursor - 1)
+            elif key in (curses.KEY_NPAGE,):
+                cursor = min(len(visible) - 1, cursor + page)
+            elif key in (curses.KEY_PPAGE,):
+                cursor = max(0, cursor - page)
+            elif key in ("g", curses.KEY_HOME):
+                cursor = 0
+            elif key in ("G", curses.KEY_END):
+                cursor = max(0, len(visible) - 1)
+            elif key in (" ", "x", "X", "d", "D") and visible:
+                slug = visible[cursor]["id"]
+                if key in ("d", "D"):
+                    staged.add(slug)
+                    default = slug
+                    message = f"Default staged: {slug}"
+                else:
+                    if key == " " and slug not in staged:
+                        staged.add(slug)
+                    else:
+                        staged.discard(slug)
+                    if slug == default and slug not in staged:
+                        default = next((model["id"] for model in available if model["id"] in staged), "")
+                    message = f"{len(staged)} models staged; press Enter to save."
+            elif key in ("\n", "\r", curses.KEY_ENTER):
+                if not staged:
+                    message = "Select at least one model before saving."
+                else:
+                    return manager_result(chosen, staged, default, available)
+
+    try:
+        updated = curses.wrapper(screen)
+    except curses.error as exc:
+        raise SetupError(f"Could not start the terminal model manager: {exc}") from exc
+    if updated is None:
+        UI.row("CANCELLED", "No model changes were saved.", "amber")
+    elif (updated["models"], updated["default"]) == (chosen["models"], chosen["default"]):
+        UI.done("Selection unchanged.")
+    else:
+        current_selection = sha(p["selection"].read_bytes()) if p["selection"].exists() else None
+        if current_selection != starting_selection:
+            raise SetupError("The selection changed while the manager was open. Reopen it to preserve those edits.")
+        update_selection(updated)
+
+
+def update_selection(chosen: dict) -> None:
+    p = paths()
+    old = selection()
+    verify_managed(old, p)
+    ids = [m["id"] for m in chosen["models"]]
+    if not ids or len(set(ids)) != len(ids) or chosen["default"] not in ids:
+        raise SetupError("Choose at least one unique model and a default from that selection.")
+    catalog, profile = catalog_bytes(p["home"], chosen), profile_bytes(p["catalog"], chosen["default"])
+    tomllib.loads(profile.decode())
+    active = None
+    desktop_state = None
+    dirty_desktop = False
+    if p["state"].exists():
+        desktop_state = json.loads(p["state"].read_text())
+        current = p["config"].read_bytes()
+        if sha(current) != desktop_state["active_sha256"]:
+            try:
+                current_config = tomllib.loads(current.decode())
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise SetupError(f"Edited desktop config cannot be parsed: {exc}") from exc
+            if (current_config.get("model") != old["default"]
+                    or current_config.get("model_provider") != "openrouter"
+                    or current_config.get("model_catalog_json") != str(p["catalog"])
+                    or START_MARKER not in current.decode() or END_MARKER not in current.decode()):
+                raise SetupError("Desktop config changed its model or provider; no model changes made. Merge it first.")
+            dirty_desktop = True
+            active = replace_root_keys(current.decode(), {"model": json.dumps(chosen["default"])})
+            tomllib.loads(active)
+        else:
+            active = replace_root_keys(current.decode(), {"model": json.dumps(chosen["default"])})
+            tomllib.loads(active)
+    # Prepared files belong to this tool; preserve copies before replacing them.
+    for label, data in (("catalog", catalog), ("profile", profile)):
+        if p[label].exists() and p[label].read_bytes() == data:
+            continue
+        if p[label].exists():
+            backup = p[label].with_name(f"{p[label].name}.backup-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}")
+            atomic_write(backup, p[label].read_bytes())
+        atomic_write(p[label], data)
+    if active is not None and active.encode() != current:
+        atomic_write(p["config"], active.encode())
+        if not dirty_desktop:
+            desktop_state["active_sha256"] = sha(active.encode())
+            atomic_write(p["state"], (json.dumps(desktop_state, indent=2) + "\n").encode())
+    chosen.update(catalog_sha256=sha(catalog), profile_sha256=sha(profile))
+    selected_data = (json.dumps(chosen, indent=2) + "\n").encode()
+    if not p["selection"].exists() or p["selection"].read_bytes() != selected_data:
+        atomic_write(p["selection"], selected_data)
+    refresh_mixed_catalog()
+    UI.done(f"{len(ids)} models selected; default: {chosen['default']}.")
+    UI.row("NEXT", "Restart Codex to refresh the selector; existing tasks may retain settings.")
+    if dirty_desktop:
+        UI.row("CONFIG NOTICE", "Your desktop config edits were preserved; desktop off still requires a manual merge.", "amber")
+
+
+def sync_selection_artifacts() -> None:
+    """Regenerate BCU labels/profile without reading or changing the desktop config."""
+    p = paths()
+    chosen = selection()
+    verify_managed(chosen, p)
+    catalog = catalog_bytes(p["home"], chosen)
+    profile = profile_bytes(p["catalog"], chosen["default"])
+    tomllib.loads(profile.decode())
+    for label, data in (("catalog", catalog), ("profile", profile)):
+        if p[label].exists() and p[label].read_bytes() == data:
+            continue
+        if p[label].exists():
+            backup = p[label].with_name(f"{p[label].name}.backup-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}")
+            atomic_write(backup, p[label].read_bytes())
+        atomic_write(p[label], data)
+    chosen.update(catalog_sha256=sha(catalog), profile_sha256=sha(profile))
+    atomic_write(p["selection"], (json.dumps(chosen, indent=2) + "\n").encode())
+    refresh_mixed_catalog()
+    UI.done(f"Refreshed {len(chosen['models'])} BCU selector labels without changing desktop settings.")
+    UI.row("NEXT", "Quit and relaunch Codex to reload the model catalog.")
+
+
+def model_commands(args: argparse.Namespace) -> None:
+    chosen = selection()
+    current = [m["id"] for m in chosen["models"]]
+    if args.action in (None, "manage", "select"):
+        model_manager(chosen, getattr(args, "query", ""))
+    elif args.action in ("add", "remove", "default") and args.model is None:
+        model_manager(chosen, sort_mode="selected first" if args.action != "add" else "popular")
+    elif args.action == "list":
+        UI.section("Models in selector")
+        for m in chosen["models"]:
+            star = "★" if m["id"] == chosen["default"] else "·"
+            print("  " + UI.paint(star, "amber" if star == "★" else "violet") + " " +
+                  UI.paint(m["id"], "cyan") + UI.paint("  /  " + safe_text(m["name"]), "dim"))
+        UI.row("★ DEFAULT", "Desktop OpenRouter mode exposes this selected list.", "amber")
+    elif args.action == "search":
+        available = openrouter_models(args.query, 40)
+        UI.section(f"OpenRouter results for {args.query or 'popular models'}")
+        for m in available:
+            badge = UI.paint("  ✓ SELECTED", "mint") if m["id"] in current else ""
+            print("  " + UI.paint(m["id"], "cyan") +
+                  UI.paint(f"  /  {safe_text(m.get('name'))} · {m.get('context_length', '?')} context", "dim") + badge)
+    elif args.action == "add":
+        if not MODEL_ID.fullmatch(args.model):
+            raise SetupError("Use an exact OpenRouter model ID, such as anthropic/claude-opus-5.")
+        matches = openrouter_models(args.model, 1000)
+        found = next((m for m in matches if m["id"] == args.model), None)
+        if found is None:
+            raise SetupError("Model not found in OpenRouter's tool-capable catalog; use `model search`.")
+        if args.model not in current:
+            chosen["models"].append(model_record(found))
+        update_selection(chosen)
+    elif args.action == "remove":
+        if args.model not in current:
+            raise SetupError("That model is not selected.")
+        chosen["models"] = [m for m in chosen["models"] if m["id"] != args.model]
+        if chosen["models"] and chosen["default"] == args.model:
+            chosen["default"] = chosen["models"][0]["id"]
+        update_selection(chosen)
+    elif args.action == "default":
+        if args.model not in current:
+            raise SetupError("Add the model with `model add` before making it the default.")
+        chosen["default"] = args.model
+        update_selection(chosen)
+    elif args.action == "sync":
+        sync_selection_artifacts()
+
+
+def replace_root_keys(original: str, updates: dict[str, str]) -> str:
+    lines = original.splitlines(keepends=True)
+    first_table = next((i for i, line in enumerate(lines) if re.match(r"^\s*\[", line)), len(lines))
+    head, tail = lines[:first_table], lines[first_table:]
+    present: set[str] = set()
+    replacement = []
+    pattern = re.compile(r"^\s*(model|model_provider|model_catalog_json|model_reasoning_effort)\s*=")
+    for line in head:
+        match = pattern.match(line)
+        if match and match.group(1) in updates:
+            key = match.group(1)
+            if key in present:
+                raise SetupError(f"Duplicate top-level {key} in existing Codex config.")
+            present.add(key)
+            replacement.append(f"{key} = {updates[key]}\n")
+        else:
+            replacement.append(line)
+    if replacement and not replacement[-1].endswith("\n"):
+        replacement[-1] += "\n"
+    for key in MANAGED_KEYS:
+        if key in updates and key not in present:
+            replacement.append(f"{key} = {updates[key]}\n")
+    return "".join(replacement + tail)
+
+
+def desktop_on() -> None:
+    p = paths()
+    if not p["profile"].is_file() or not p["catalog"].is_file():
+        raise SetupError("Run `bobocodexultra auth login` first.")
+    if not key_exists():
+        raise SetupError("No Keychain item found. Run `bobocodexultra auth login` in Terminal.")
+    if p["state"].exists():
+        raise SetupError("Desktop OpenRouter mode is already active; run `status` or `desktop off`.")
+    config = p["config"]
+    original = config.read_bytes() if config.exists() else b""
+    try:
+        parsed = tomllib.loads(original.decode())
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise SetupError(f"Existing Codex config cannot be parsed: {exc}") from exc
+    if "openrouter" in parsed.get("model_providers", {}):
+        raise SetupError("An OpenRouter provider already exists in the main config; refusing to replace it.")
+    if START_MARKER in original.decode() or END_MARKER in original.decode():
+        raise SetupError("A previous managed provider block exists; inspect the config manually.")
+    updates = {
+        "model": json.dumps(selection()["default"]),
+        "model_provider": json.dumps("openrouter"),
+        "model_catalog_json": json.dumps(str(p["catalog"])),
+        "model_reasoning_effort": json.dumps("high"),
+    }
+    modified = replace_root_keys(original.decode(), updates).rstrip() + "\n\n"
+    modified += START_MARKER + "\n" + provider_toml() + END_MARKER + "\n"
+    tomllib.loads(modified)
+    p["backups"].mkdir(mode=0o700, parents=True, exist_ok=True)
+    backup = p["backups"] / f"config-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}.toml"
+    with backup.open("xb") as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        handle.write(original)
+        handle.flush()
+        os.fsync(handle.fileno())
+    active = modified.encode()
+    original_mode = stat.S_IMODE(config.stat().st_mode) if config.exists() else 0o600
+    state = {
+        "backup": str(backup), "original_sha256": sha(original),
+        "active_sha256": sha(active), "original_mode": original_mode,
+    }
+    atomic_write(config, active)
+    atomic_write(p["state"], (json.dumps(state, indent=2) + "\n").encode())
+    UI.done("Desktop OpenRouter mode is active in your user-level Codex config.")
+    UI.row("BACKUP", str(backup), "mint")
+    UI.row("NEXT", "Quit and relaunch Codex to refresh its model selector.")
+
+
+def desktop_off() -> None:
+    p = paths()
+    if not p["state"].is_file():
+        UI.done("Desktop OpenRouter mode is not active; nothing to restore.")
+        return
+    state = json.loads(p["state"].read_text())
+    backup = Path(state["backup"]).resolve()
+    if backup.parent != p["backups"].resolve():
+        raise SetupError("Backup path in state file is outside the managed backup folder.")
+    original, active = backup.read_bytes(), p["config"].read_bytes()
+    if sha(original) != state["original_sha256"]:
+        raise SetupError("Backup checksum mismatch; no changes made.")
+    if sha(active) != state["active_sha256"]:
+        raise SetupError(
+            "Codex config changed while OpenRouter mode was active. To preserve those edits, "
+            f"restore/merge manually from {backup}; no changes were made."
+        )
+    atomic_write(p["config"], original, state["original_mode"])
+    p["state"].unlink()
+    UI.done("Original Codex configuration restored.")
+    UI.row("BACKUP", str(backup), "mint")
+    UI.row("NEXT", "Quit and relaunch Codex to refresh its model selector.")
+
+
+def native_reset() -> None:
+    """Restore BCU-owned root settings while preserving unrelated edits made later."""
+    p = paths()
+    if not p["state"].is_file():
+        UI.done("Codex is already in native mode; no BCU desktop state was found.")
+        return
+    state = json.loads(p["state"].read_text())
+    backup = Path(state["backup"]).resolve()
+    if backup.parent != p["backups"].resolve() or not backup.is_file():
+        raise SetupError("The original Codex backup is missing or outside BCU's backup folder.")
+    original = backup.read_bytes()
+    current = p["config"].read_bytes()
+    if sha(original) != state["original_sha256"]:
+        raise SetupError("Original backup checksum mismatch; native reset made no changes.")
+    try:
+        original_config = tomllib.loads(original.decode())
+        tomllib.loads(current.decode())
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise SetupError(f"Codex configuration cannot be safely reset: {exc}") from exc
+    text = current.decode()
+    block = re.compile(re.escape(START_MARKER) + r"\n.*?" + re.escape(END_MARKER) + r"\n?", re.S)
+    if not block.search(text):
+        raise SetupError("BCU's managed provider block is missing; native reset made no changes.")
+    text = block.sub("", text)
+    lines = text.splitlines(keepends=True)
+    first_table = next((i for i, line in enumerate(lines) if re.match(r"^\s*\[", line)), len(lines))
+    head, tail = lines[:first_table], lines[first_table:]
+    pattern = re.compile(r"^\s*(model|model_provider|model_catalog_json|model_reasoning_effort)\s*=")
+    restored: list[str] = []
+    seen: set[str] = set()
+    for line in head:
+        match = pattern.match(line)
+        if not match:
+            restored.append(line)
+            continue
+        key = match.group(1)
+        if key in seen:
+            raise SetupError(f"Duplicate top-level {key}; native reset made no changes.")
+        seen.add(key)
+        if key in original_config:
+            restored.append(f"{key} = {json.dumps(original_config[key])}\n")
+        # A BCU-added key absent from the original is intentionally removed.
+    for key in MANAGED_KEYS:
+        if key in original_config and key not in seen:
+            restored.append(f"{key} = {json.dumps(original_config[key])}\n")
+    merged = ("".join(restored + tail).rstrip() + "\n").encode()
+    parsed = tomllib.loads(merged.decode())
+    if "openrouter" in parsed.get("model_providers", {}):
+        raise SetupError("OpenRouter provider remains after merge; native reset made no changes.")
+    p["backups"].mkdir(mode=0o700, parents=True, exist_ok=True)
+    recovery = p["backups"] / f"pre-native-reset-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}.toml"
+    with recovery.open("xb") as handle:
+        os.fchmod(handle.fileno(), 0o600)
+        handle.write(current)
+        handle.flush()
+        os.fsync(handle.fileno())
+    atomic_write(p["config"], merged, state.get("original_mode", 0o600))
+    p["state"].unlink()
+    UI.done("Codex desktop configuration is back in native mode.")
+    UI.row("PRESERVED", "Unrelated settings changed after BCU activation were retained.", "mint")
+    UI.row("RECOVERY", str(recovery), "mint")
+    UI.row("NEXT", "Quit and relaunch Codex to reload the native model selector.")
+
+
+def status() -> None:
+    p = paths()
+    UI.section("System status")
+    UI.row("KEYCHAIN", UI.paint("READY", "mint") if key_exists() else UI.paint("MISSING / LOCKED", "amber"))
+    UI.row("CLI PROFILE", "prepared" if p["profile"].exists() else "not prepared")
+    UI.row("MODEL CATALOG", "prepared" if p["catalog"].exists() else "not prepared")
+    control = mixed_controller()
+    UI.row("DESKTOP MODE", "shared: ChatGPT + Ollama + BCU" if control.state.exists() else "OpenRouter (legacy)" if p["state"].exists() else "original")
+    if control.state.exists():
+        UI.row("BCU ROUTER", "healthy" if router_module().health().get("home") == str(p["home"]) else "offline; run on")
+    if p["state"].exists():
+        state = json.loads(p["state"].read_text())
+        UI.row("CONFIG CLEAN", str(bool(p["config"].exists() and
+                                        sha(p["config"].read_bytes()) == state["active_sha256"])))
+    UI.row("MODELS", ", ".join(m["id"] for m in selection()["models"]))
+
+
+def parse_utc(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def usage_roots(home: Path) -> tuple[Path, Path]:
+    return home / "sessions", home / "archived_sessions"
+
+
+def local_usage_records(home: Path, since: datetime | None = None) -> tuple[list[dict], int]:
+    """Read final per-turn counters from OpenRouter Codex rollouts without double-counting totals."""
+    records: list[dict] = []
+    unreadable = 0
+    files = []
+    seen: set[tuple] = set()
+    for root in usage_roots(home):
+        if root.exists():
+            files.extend(root.rglob("*.jsonl"))
+    for path in files:
+        provider = None
+        session_id = path.name
+        current_model = None
+        event_records: list[dict] = []
+        structured_records: dict[str, dict] = {}
+        try:
+            with path.open(errors="strict") as handle:
+                for line in handle:
+                    obj = json.loads(line)
+                    stamp = parse_utc(obj.get("timestamp"))
+                    payload = obj.get("payload") or {}
+                    kind = obj.get("type")
+                    if kind == "session_meta":
+                        provider = payload.get("model_provider")
+                        session_id = str(payload.get("session_id") or payload.get("id") or session_id)
+                    elif kind == "turn_context":
+                        current_model = payload.get("model") or current_model
+                    if provider != "openrouter" or not current_model:
+                        continue
+                    usage = None
+                    turn_id = None
+                    if kind == "token_usage_record":
+                        usage = payload.get("turn_token_usage") or payload.get("usage")
+                        turn_id = payload.get("turn_id") or payload.get("root_turn_id")
+                    elif kind == "event_msg" and payload.get("type") == "token_count":
+                        usage = (payload.get("info") or {}).get("last_token_usage")
+                        turn_id = payload.get("turn_id") or payload.get("root_turn_id")
+                    if not isinstance(usage, dict):
+                        continue
+                    values = {key: int(usage.get(key) or 0) for key in
+                              ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+                               "output_tokens", "reasoning_output_tokens", "total_tokens")}
+                    if not any(values.values()):
+                        continue
+                    record = {"timestamp": stamp, "model": current_model, **values}
+                    if kind == "token_usage_record":
+                        key = str(turn_id or f"{current_model}:{len(structured_records)}")
+                        record["_dedupe"] = ("turn", session_id, key, current_model)
+                        structured_records[key] = record
+                    else:
+                        record["_dedupe"] = ("event", session_id, stamp.isoformat() if stamp else "", current_model,
+                                             *values.values())
+                        event_records.append(record)
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+            unreadable += 1
+            continue
+        # Newer Codex versions emit structured per-turn records. Older versions emit
+        # token_count events. Never combine both formats from one rollout.
+        chosen_records = list(structured_records.values()) if structured_records else event_records
+        for record in chosen_records:
+            identity = record.pop("_dedupe")
+            if identity in seen:
+                continue
+            seen.add(identity)
+            if since is None or (record["timestamp"] and record["timestamp"] >= since):
+                records.append(record)
+    return records, unreadable
+
+
+def usage_prices(refresh: bool = True) -> tuple[dict[str, dict], str]:
+    p = paths()
+    cache = p["usage_cache"]
+    if refresh:
+        try:
+            models = openrouter_pricing_catalog()
+            prices = {model["id"]: {
+                "prompt": str((model.get("pricing") or {}).get("prompt") or ""),
+                "completion": str((model.get("pricing") or {}).get("completion") or ""),
+                "cache_read": str((model.get("pricing") or {}).get("input_cache_read") or ""),
+                "cache_write": str((model.get("pricing") or {}).get("input_cache_write") or ""),
+            } for model in models}
+            data = {"fetched_at": datetime.now(timezone.utc).isoformat(), "prices": prices}
+            atomic_write(cache, (json.dumps(data, indent=2) + "\n").encode())
+            return prices, data["fetched_at"]
+        except SetupError:
+            pass
+    if cache.exists():
+        data = json.loads(cache.read_text())
+        return data.get("prices", {}), data.get("fetched_at", "unknown")
+    return {}, "unavailable"
+
+
+def decimal_price(prices: dict, model: str, key: str) -> Decimal | None:
+    try:
+        value = Decimal(str((prices.get(model) or {}).get(key, "")))
+        return value if value.is_finite() and value >= 0 else None
+    except (InvalidOperation, TypeError):
+        return None
+
+
+def estimate_record_cost(record: dict, prices: dict) -> tuple[Decimal | None, bool]:
+    prompt = decimal_price(prices, record["model"], "prompt")
+    completion = decimal_price(prices, record["model"], "completion")
+    if prompt is None or completion is None:
+        return None, False
+    cached = min(record["cached_input_tokens"], record["input_tokens"])
+    cache_write_tokens = min(record["cache_write_input_tokens"], max(0, record["input_tokens"] - cached))
+    uncached = max(0, record["input_tokens"] - cached - cache_write_tokens)
+    cache_read = decimal_price(prices, record["model"], "cache_read")
+    cache_write = decimal_price(prices, record["model"], "cache_write")
+    cost = Decimal(uncached) * prompt
+    cost += Decimal(cached) * (cache_read if cache_read is not None else prompt)
+    cost += Decimal(cache_write_tokens) * (cache_write if cache_write is not None else prompt)
+    cost += Decimal(record["output_tokens"]) * completion
+    return cost, cache_read is not None
+
+
+def usage(days: int, as_json: bool, offline: bool) -> None:
+    if days < 0:
+        raise SetupError("--days must be zero or greater; zero means all locally retained history.")
+    since = None if days == 0 else datetime.now(timezone.utc) - timedelta(days=days)
+    records, unreadable = local_usage_records(paths()["home"], since)
+    prices, fetched = usage_prices(not offline)
+    totals: dict[str, dict] = {}
+    for record in records:
+        bucket = totals.setdefault(record["model"], {key: 0 for key in
+            ("turns", "input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+             "output_tokens", "reasoning_output_tokens", "total_tokens")})
+        bucket["turns"] += 1
+        for key in bucket:
+            if key != "turns":
+                bucket[key] += record[key]
+    estimated_total = Decimal(0)
+    priced_models = 0
+    cache_discount_models = 0
+    for model, bucket in totals.items():
+        cost = Decimal(0)
+        complete = True
+        discounted = False
+        for record in (item for item in records if item["model"] == model):
+            item_cost, item_discounted = estimate_record_cost(record, prices)
+            if item_cost is None:
+                complete = False
+                break
+            cost += item_cost
+            discounted = discounted or item_discounted
+        bucket["estimated_cost_usd"] = float(cost) if complete else None
+        if complete:
+            estimated_total += cost
+            priced_models += 1
+            cache_discount_models += int(discounted)
+    output = {
+        "source": "local Codex rollout token counters",
+        "period_days": days,
+        "records": len(records), "unreadable_files": unreadable,
+        "pricing_catalog_fetched_at": fetched,
+        "estimated_total_usd": float(estimated_total) if priced_models == len(totals) else None,
+        "models": totals,
+    }
+    if as_json:
+        print(json.dumps(output, indent=2, sort_keys=True))
+        return
+    UI.section("BCU local usage")
+    UI.row("WINDOW", "all retained history" if days == 0 else f"last {days} days")
+    UI.row("SOURCE", "Exact tokens from local Codex OpenRouter sessions", "mint")
+    if not totals:
+        UI.row("RESULT", "No locally recorded OpenRouter token usage found.", "amber")
+        return
+    for model, bucket in sorted(totals.items(), key=lambda item: item[1]["total_tokens"], reverse=True):
+        UI.section(model)
+        UI.row("TURNS", f"{bucket['turns']:,}")
+        UI.row("INPUT", f"{bucket['input_tokens']:,} ({bucket['cached_input_tokens']:,} cached)")
+        UI.row("CACHE WRITE", f"{bucket['cache_write_input_tokens']:,}")
+        UI.row("OUTPUT", f"{bucket['output_tokens']:,} (+ {bucket['reasoning_output_tokens']:,} reasoning)")
+        UI.row("TOTAL", f"{bucket['total_tokens']:,}", "mint")
+        estimate = bucket["estimated_cost_usd"]
+        UI.row("EST. COST", f"${estimate:,.6f}" if estimate is not None else "unavailable for current catalog", "amber")
+    grand_tokens = sum(bucket["total_tokens"] for bucket in totals.values())
+    UI.section("Total")
+    UI.row("TOKENS", f"{grand_tokens:,}", "mint")
+    UI.row("EST. COST", f"${estimated_total:,.6f}" if priced_models == len(totals) else "partial/unavailable", "amber")
+    UI.row("PRICING AS OF", fetched)
+    UI.row("IMPORTANT", "Cost is a back-estimate using current base catalog prices, not an invoice.", "amber")
+    UI.row("CACHE", "Cached tokens use catalog cache-read price when advertised; otherwise prompt price.")
+    if unreadable:
+        UI.row("SKIPPED", f"{unreadable} unreadable rollout files", "amber")
+
+
+def launch(arguments: list[str]) -> None:
+    p = paths()
+    if not p["profile"].is_file():
+        raise SetupError("Run `bobocodexultra auth login` first.")
+    if not key_exists():
+        raise SetupError("Key not found in macOS Keychain. Run `bobocodexultra auth login`.")
+    codex = shutil.which("codex")
+    if not codex:
+        raise SetupError("Codex CLI is not on PATH.")
+    args = arguments[1:] if arguments and arguments[0] == "--" else arguments
+    os.execv(codex, [codex, "--profile", "openrouter", *args])
+
+
+def smoke(model: str, agents: bool) -> None:
+    if not key_exists():
+        raise SetupError("Key not found in macOS Keychain. Run `auth login` first.")
+    if model not in [m["id"] for m in selection()["models"]]:
+        raise SetupError("Select the model first with `model add` or `model select`.")
+    codex = shutil.which("codex")
+    if not codex:
+        raise SetupError("Codex CLI is not on PATH.")
+    if agents:
+        prompt = (
+            "Read-only integration check. Spawn exactly two subagents: one should report the "
+            "current directory name, the other should report whether it is a git repository. "
+            "Wait for both and summarize their results in one short sentence. Do not edit files."
+        )
+    else:
+        prompt = "Read-only integration check: answer with the exact word READY. Do not edit files."
+    UI.row("BILLED TEST", f"{'subagent' if agents else 'basic'} check with {model}", "amber")
+    result = subprocess.run([
+        codex, "exec", "--profile", "openrouter", "--model", model,
+        "--sandbox", "read-only", "--skip-git-repo-check", "--ephemeral",
+        prompt,
+    ], check=False)
+    if result.returncode:
+        raise SetupError(f"Codex smoke test exited with status {result.returncode}.")
+
+
+def install() -> None:
+    target = Path.home() / ".local" / "bin" / "bobocodexultra"
+    alias = target.with_name("boboultracodex")
+    source = Path(__file__).resolve()
+    if target.is_symlink():
+        raise SetupError(f"{target} is a symlink; refusing to replace it.")
+    if target.exists() and b"Keychain-backed OpenRouter profile" not in target.read_bytes()[:512]:
+        raise SetupError(f"{target} exists and is not this tool; refusing to replace it.")
+    if alias.exists() or alias.is_symlink():
+        if not alias.is_symlink() or os.readlink(alias) != target.name:
+            raise SetupError(f"{alias} already exists; refusing to replace it.")
+    if target != source:
+        module = source.with_name("bcu_router.py")
+        if not module.is_file():
+            raise SetupError("Missing bcu_router.py; install from the complete BCU folder.")
+        module_target = target.with_name("bcu_router.py")
+        if module_target.exists() and not module_target.read_bytes().startswith(b'"""BCU local routing service'):
+            raise SetupError("An unrelated bcu_router.py already exists beside the CLI.")
+        atomic_write(module_target, module.read_bytes())
+        atomic_write(target, source.read_bytes(), 0o700)
+    if not alias.is_symlink():
+        alias.symlink_to(target.name)
+    UI.done(f"Installed {target.name} and {alias.name} in {target.parent}")
+    if str(target.parent) not in os.environ.get("PATH", "").split(os.pathsep):
+        print("Add ~/.local/bin to PATH in your shell startup file, then open a new terminal.")
+    else:
+        UI.row("NEXT", "Run `bobocodexultra docs` from any directory.")
+
+
+def docs(topic: str) -> None:
+    sections = {
+        "auth": [
+            ("login", "Store the key in macOS Keychain and enable the shared desktop selector."),
+            ("auth login --no-desktop", "Store or replace the key without changing desktop mode."),
+            ("auth prepare", "Prepare a profile/catalog without a key or desktop change."),
+            ("auth status", "Check whether a Keychain item exists; never print its value."),
+        ],
+        "model": [
+            ("model", "Open the model manager directly."),
+            ("model manage", "Full-screen picker: / search, S sort, arrows scroll, Space multi-select, Enter save, Q cancel."),
+            ("model list", "Show your selected lineup and default."),
+            ('model search "claude"', "Browse current tool-capable OpenRouter models."),
+            ('model select "claude"', "Open the TUI with an initial search (optional); I shows details."),
+            ("model add [author/model-id]", "Open the TUI, or add one exact ID noninteractively."),
+            ("model remove [author/model-id]", "Open the TUI, or remove one exact ID."),
+            ("model default [author/model-id]", "Open the TUI, or choose one exact default ID."),
+            ("model sync", "Regenerate selector labels; selected models end with (BCU)."),
+        ],
+        "desktop": [
+            ("on", "Start BCU locally and combine native, Ollama, and BCU models in Codex Desktop."),
+            ("off", "Restore your previous desktop settings while preserving unrelated edits."),
+            ("doctor", "Check the desktop endpoint, service, and combined catalog."),
+        ],
+        "codex": [
+            ("codex launch", "Open Codex CLI with the OpenRouter profile."),
+            ("codex smoke", "Optional billed read-only model call."),
+            ("codex smoke --agents", "Optional billed read-only subagent check."),
+        ],
+    }
+    topics = sections if topic == "all" else {topic: sections[topic]}
+    for label, commands in topics.items():
+        UI.section(label)
+        for command, explanation in commands:
+            print("  " + UI.paint("› " + command, "cyan"))
+            print("    " + UI.paint(explanation, "dim"))
+    if topic == "all":
+        UI.section("Essentials")
+        UI.row("login", "Securely enter your OpenRouter key and enable the shared desktop selector.")
+        UI.row("on / off", "Enable shared desktop mode or return to your previous setup.")
+        UI.row("models", "Search, sort and choose multiple BCU models in the graphical terminal picker.")
+        UI.row("sync", "Refresh the combined desktop model catalog.")
+        UI.row("doctor", "Diagnose desktop routing without making a model call.")
+        UI.row("status", "Check key, profile, catalog, desktop mode, and lineup.")
+        UI.row("usage", "Exact locally recorded BCU tokens plus current-price cost estimates.")
+        UI.row("reset", "Alias for off.")
+        UI.row("docs [topic]", "Read these built-in docs; topics: auth, model, desktop, codex.")
+        UI.row("install", "Update both names in ~/.local/bin from this executable.")
+        UI.row("ALIAS", "boboultracodex works identically to bobocodexultra.", "pink")
+    UI.section("Safety")
+    UI.row("CREDENTIALS", "Only the macOS Keychain stores the API key.", "mint")
+    UI.row("CHARGES", "Browsing metadata is read-only; model calls and smoke tests may incur charges.", "amber")
+    UI.row("RESTART", "Relaunch Codex after changing desktop mode or selected models.")
+    UI.row("REFERENCE", "https://learn.chatgpt.com/docs/config-file/config-advanced", "dim")
+
+
+def legacy_arguments(argv: list[str]) -> list[str]:
+    """Keep commands from earlier versions working without cluttering new help."""
+    aliases = {
+        "login": ("auth", "login"), "on": ("desktop", "on"), "off": ("desktop", "off"),
+        "add": ("model", "add"), "remove": ("model", "remove"),
+        "default": ("model", "default"), "sync": ("model", "sync"),
+        "setup": ("auth", "login"), "prepare": ("auth", "prepare"),
+        "models": ("model",), "desktop-on": ("desktop", "on"),
+        "desktop-off": ("desktop", "off"), "launch": ("codex", "launch"),
+        "smoke": ("codex", "smoke"),
+    }
+    return [*aliases.get(argv[0], (argv[0],)), *argv[1:]] if argv else argv
+
+
+def main() -> None:
+    if sys.argv[1:] == ["_serve"]:
+        router_module().serve(paths()["home"])
+        return
+    parser = argparse.ArgumentParser(description="BCU: shared models for Codex Desktop.",
+                                     epilog="Everyday: login | on | off | models | sync | doctor | docs. Nested commands remain supported.")
+    parser.add_argument("--no-color", action="store_true", help="Plain text output (also respects NO_COLOR)")
+    parser.add_argument("--no-animate", action="store_true", help="Disable motion (also respects BOBOCODEXULTRA_NO_ANIM)")
+    sub = parser.add_subparsers(dest="command")
+    auth_sub = sub.add_parser("auth", help="Secure Keychain login and profile preparation").add_subparsers(dest="action", required=True)
+    login_parser = auth_sub.add_parser("login", help="Securely save a key and activate desktop mode")
+    login_parser.add_argument("--no-desktop", action="store_true", help="Leave the desktop config unchanged")
+    prepare_parser = auth_sub.add_parser("prepare", help="Prepare profile/catalog without a key")
+    prepare_parser.add_argument("--refresh", action="store_true", help="Back up and replace changed prepared files")
+    auth_sub.add_parser("status", help="Check Keychain item presence without reading the key")
+    sub.add_parser("status", help="Show complete configuration status")
+    sub.add_parser("doctor", help="Check the shared desktop router and configuration")
+    usage_parser = sub.add_parser("usage", help="Report legacy OpenRouter CLI-profile tokens and estimated cost")
+    usage_parser.add_argument("--days", type=int, default=30, help="Lookback days; 0 means all retained history")
+    usage_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    usage_parser.add_argument("--offline", action="store_true", help="Use cached pricing without contacting OpenRouter")
+    sub.add_parser("reset", help="Alias for off: restore the previous desktop setup")
+    sub.add_parser("install", help="Install both command names in ~/.local/bin")
+    docs_parser = sub.add_parser("docs", help="Read built-in command documentation")
+    docs_parser.add_argument("topic", nargs="?", choices=("auth", "model", "desktop", "codex"), default="all")
+    desktop_sub = sub.add_parser("desktop", help="Control shared desktop routing (shortcuts: on / off)").add_subparsers(dest="action", required=True)
+    desktop_sub.add_parser("on", help="Enable ChatGPT, Ollama and BCU models side by side")
+    desktop_sub.add_parser("off", help="Restore the previous native/Ollama desktop configuration")
+    codex_sub = sub.add_parser("codex", help="Launch Codex or check the integration").add_subparsers(dest="action", required=True)
+    launch_parser = codex_sub.add_parser("launch", help="Launch Codex CLI with the OpenRouter profile")
+    launch_parser.add_argument("codex_args", nargs=argparse.REMAINDER)
+    smoke_parser = codex_sub.add_parser("smoke", help="Optional billed read-only integration test")
+    smoke_parser.add_argument("--model", help="Exact selected model ID (defaults to selected default)")
+    smoke_parser.add_argument("--agents", action="store_true", help="Ask for two subagents")
+    model_sub = sub.add_parser("model", help="Choose models shown in Codex").add_subparsers(dest="action")
+    model_sub.add_parser("manage", help="Full-screen search, sort, scroll, and multi-select TUI")
+    model_sub.add_parser("list", help="Show selected models and default")
+    model_sub.add_parser("sync", help="Regenerate selected model labels, including the (BCU) marker")
+    search_parser = model_sub.add_parser("search", help="Search OpenRouter's tool-capable models")
+    search_parser.add_argument("query", nargs="?", default="")
+    select_parser = model_sub.add_parser("select", help="Open full-screen manager with optional starting search")
+    select_parser.add_argument("query", nargs="?", default="")
+    for command in ("add", "remove", "default"):
+        model_parser = model_sub.add_parser(command, help=f"{command.capitalize()} exact ID, or open TUI without one")
+        model_parser.add_argument("model", nargs="?")
+    argv = sys.argv[1:]
+    global_flags = [item for item in argv if item in ("--no-color", "--no-animate")]
+    argv = global_flags + legacy_arguments([item for item in argv if item not in global_flags])
+    args = parser.parse_args(argv)
+    if args.no_color:
+        UI.color = False
+        UI.motion = False
+    if args.no_animate:
+        UI.motion = False
+    if (args.command != "codex" or args.action != "launch") and not (args.command == "usage" and args.json):
+        UI.heading({"auth": "Secure access", "model": "Model selector", "desktop": "Desktop mode",
+                    "codex": "Codex operations", "docs": "Field guide", "status": "System check",
+                    "usage": "Token & cost ledger", "reset": "Native Codex reset",
+                    "doctor": "Desktop health", "install": "Command installer"}.get(args.command, "Codex Desktop"))
+    try:
+        if args.command is None:
+            desktop_home()
+        elif args.command == "docs":
+            docs(args.topic)
+        elif args.command == "auth" and args.action == "login":
+            prepare()
+            save_key()
+            if not args.no_desktop:
+                mixed_on()
+        elif args.command == "auth" and args.action == "prepare":
+            prepare(args.refresh)
+        elif args.command == "auth" and args.action == "status":
+            UI.section("Authentication")
+            UI.row("KEYCHAIN", "present" if key_exists() else "not found / locked")
+        elif args.command == "status":
+            status()
+        elif args.command == "doctor":
+            doctor()
+        elif args.command == "usage":
+            usage(args.days, args.json, args.offline)
+        elif args.command == "reset":
+            mixed_off()
+        elif args.command == "install":
+            install()
+        elif args.command == "model":
+            model_commands(args)
+        elif args.command == "desktop" and args.action == "on":
+            mixed_on()
+        elif args.command == "desktop" and args.action == "off":
+            mixed_off()
+        elif args.command == "codex" and args.action == "launch":
+            launch(args.codex_args)
+        elif args.command == "codex" and args.action == "smoke":
+            smoke(args.model or selection()["default"], args.agents)
+    except (SetupError, OSError, ValueError) as exc:
+        print(f"bobocodexultra: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
