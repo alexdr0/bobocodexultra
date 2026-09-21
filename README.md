@@ -1,6 +1,6 @@
 # Bobo Codex Ultra — BCU
 
-![BCU circuit-B icon](assets/BCU-icon.png)
+![BCU Inter B in a square icon](assets/BCU-icon.png)
 
 BCU adds OpenRouter models alongside native ChatGPT and Ollama models in the **Codex desktop app**. It runs a local routing service and keeps Codex's built-in OpenAI provider and existing ChatGPT sign-in. It does not patch the signed desktop application.
 
@@ -57,7 +57,7 @@ Reopen Codex, choose a `(BCU)` model, and try a small, read-only task asking Cod
 
 ## macOS menu bar
 
-`bobocodexultra menu install` builds the native Swift companion into `~/Applications/Bobo Codex Ultra.app`, opens it, and enables Launch at Login using a per-user LaunchAgent. A small **circuit-B** appears in the menu bar: the monochrome template version adapts to dark/light menu bars, while the Applications icon uses a violet tile, cyan outline and pink status nodes. There is no Dock icon.
+`bobocodexultra menu install` builds the native Swift companion into `~/Applications/Bobo Codex Ultra.app`, opens it, and enables Launch at Login using a per-user LaunchAgent. Its icon is an **Inter Bold B inside a square outline with sharp corners**. The monochrome menu bar version adapts to light/dark appearances; the Applications icon is white on black. The letter is a vector outline, so Inter does not need to be installed. There is no Dock icon.
 
 The menu shows whether shared mode and its local router are available. Turn routing on/off, open a graphical **Manage Models** window, enter the OpenRouter key in Terminal's secure prompt, open Codex Desktop or the documentation, toggle Launch at Login, and **Quit BCU Menu** from the same icon. Quit closes only the menu app; it does not stop the request router or affect an active Codex task. The model window loads the OpenRouter tool-capable catalog, supports live search and sorting by popular/name/context/selected, shows your existing choices including models temporarily absent from OpenRouter, and allows multiple add/remove actions and default changes. Reopen Codex to refresh its selector after a model change.
 

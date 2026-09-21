@@ -1512,7 +1512,7 @@ def menu_open() -> None:
     result = subprocess.run(["/usr/bin/open", "-a", str(bundle)], capture_output=True, check=False)
     if result.returncode:
         raise SetupError("macOS could not open BCU Menu. Run `bobocodexultra menu install` to repair it.")
-    UI.done("BCU Menu is open; find the circuit-B icon in the menu bar.")
+    UI.done("BCU Menu is open; find the boxed B icon in the menu bar.")
 
 
 def docs(topic: str) -> None:

@@ -1,9 +1,49 @@
 import AppKit
 import SwiftUI
 
-// The status icon and Dock/Applications icon share the same hand-drawn mark:
-// a compact circuit-board B with two terminal dots inside a rounded tile.
+// Inter Bold B, outlined from rsms/inter (wght 700, opsz 14), inside a square.
+// The vector outline needs no installed font. See docs/INTER-LICENSE.txt.
 enum BCUIcon {
+    private static func letter() -> CGPath {
+        let path = CGMutablePath()
+        path.move(to: CGPoint(x: 134.642, y: 0.000))
+        path.addLine(to: CGPoint(x: 134.642, y: 1490.000))
+        path.addLine(to: CGPoint(x: 726.359, y: 1490.000))
+        path.addQuadCurve(to: CGPoint(x: 999.249, y: 1440.550), control: CGPoint(x: 889.919, y: 1490.000))
+        path.addQuadCurve(to: CGPoint(x: 1163.208, y: 1304.840), control: CGPoint(x: 1108.578, y: 1391.100))
+        path.addQuadCurve(to: CGPoint(x: 1217.838, y: 1107.419), control: CGPoint(x: 1217.838, y: 1218.579))
+        path.addQuadCurve(to: CGPoint(x: 1182.758, y: 953.509), control: CGPoint(x: 1217.838, y: 1018.979))
+        path.addQuadCurve(to: CGPoint(x: 1087.318, y: 846.450), control: CGPoint(x: 1147.678, y: 888.039))
+        path.addQuadCurve(to: CGPoint(x: 950.079, y: 787.400), control: CGPoint(x: 1026.958, y: 804.860))
+        path.addLine(to: CGPoint(x: 950.079, y: 772.320))
+        path.addQuadCurve(to: CGPoint(x: 1108.478, y: 724.590), control: CGPoint(x: 1034.118, y: 768.860))
+        path.addQuadCurve(to: CGPoint(x: 1229.338, y: 600.670), control: CGPoint(x: 1182.838, y: 680.320))
+        path.addQuadCurve(to: CGPoint(x: 1275.838, y: 410.499), control: CGPoint(x: 1275.838, y: 521.020))
+        path.addQuadCurve(to: CGPoint(x: 1218.128, y: 200.130), control: CGPoint(x: 1275.838, y: 293.100))
+        path.addQuadCurve(to: CGPoint(x: 1046.639, y: 53.580), control: CGPoint(x: 1160.418, y: 107.160))
+        path.addQuadCurve(to: CGPoint(x: 764.418, y: 0.000), control: CGPoint(x: 932.859, y: 0.000))
+        path.closeSubpath()
+        path.move(to: CGPoint(x: 440.197, y: 251.157))
+        path.addLine(to: CGPoint(x: 703.801, y: 251.157))
+        path.addQuadCurve(to: CGPoint(x: 900.003, y: 303.037), control: CGPoint(x: 838.382, y: 251.157))
+        path.addQuadCurve(to: CGPoint(x: 961.623, y: 439.498), control: CGPoint(x: 961.623, y: 354.918))
+        path.addQuadCurve(to: CGPoint(x: 931.183, y: 551.309), control: CGPoint(x: 961.623, y: 502.619))
+        path.addQuadCurve(to: CGPoint(x: 844.742, y: 627.740), control: CGPoint(x: 900.743, y: 600.000))
+        path.addQuadCurve(to: CGPoint(x: 711.641, y: 655.481), control: CGPoint(x: 788.742, y: 655.481))
+        path.addLine(to: CGPoint(x: 440.197, y: 655.481))
+        path.closeSubpath()
+        path.move(to: CGPoint(x: 440.197, y: 864.079))
+        path.addLine(to: CGPoint(x: 680.721, y: 864.079))
+        path.addQuadCurve(to: CGPoint(x: 797.912, y: 887.479), control: CGPoint(x: 746.141, y: 864.079))
+        path.addQuadCurve(to: CGPoint(x: 879.583, y: 954.340), control: CGPoint(x: 849.682, y: 910.880))
+        path.addQuadCurve(to: CGPoint(x: 909.483, y: 1058.061), control: CGPoint(x: 909.483, y: 997.801))
+        path.addQuadCurve(to: CGPoint(x: 851.703, y: 1190.203), control: CGPoint(x: 909.483, y: 1139.402))
+        path.addQuadCurve(to: CGPoint(x: 686.721, y: 1241.003), control: CGPoint(x: 793.922, y: 1241.003))
+        path.addLine(to: CGPoint(x: 440.197, y: 1241.003))
+        path.closeSubpath()
+        return path
+    }
+
     static func draw(_ size: CGFloat, template: Bool) -> NSImage {
         let image = NSImage(size: NSSize(width: size, height: size))
         image.lockFocus()
@@ -11,35 +51,27 @@ enum BCUIcon {
         let canvas = NSAffineTransform()
         canvas.scale(by: scale)
         canvas.concat()
-        let tile = NSBezierPath(roundedRect: NSRect(x: 1.3, y: 1.3, width: 21.4, height: 21.4), xRadius: 6, yRadius: 6)
-        if template {
-            NSColor.black.setStroke()
-            tile.lineWidth = 1.5
-            tile.stroke()
-        } else {
-            NSColor(calibratedRed: 0.12, green: 0.08, blue: 0.21, alpha: 1).setFill()
+        let tile = NSBezierPath(rect: NSRect(x: 1.5, y: 1.5, width: 21, height: 21))
+        if !template {
+            NSColor.black.setFill()
             tile.fill()
-            NSColor(calibratedRed: 0.40, green: 0.91, blue: 0.93, alpha: 1).setStroke()
-            tile.lineWidth = 0.9
-            tile.stroke()
         }
-        (template ? NSColor.black : NSColor.white).setStroke()
-        let mark = NSBezierPath()
-        mark.lineWidth = 2.35
-        mark.lineCapStyle = .round
-        mark.lineJoinStyle = .round
-        mark.move(to: NSPoint(x: 7.2, y: 5.3))
-        mark.line(to: NSPoint(x: 7.2, y: 18.7))
-        mark.line(to: NSPoint(x: 12, y: 18.7))
-        mark.curve(to: NSPoint(x: 12, y: 12.2), controlPoint1: NSPoint(x: 17.6, y: 18.7), controlPoint2: NSPoint(x: 17.8, y: 12.2))
-        mark.line(to: NSPoint(x: 7.2, y: 12.2))
-        mark.line(to: NSPoint(x: 12.3, y: 12.2))
-        mark.curve(to: NSPoint(x: 12, y: 5.3), controlPoint1: NSPoint(x: 18.6, y: 12.2), controlPoint2: NSPoint(x: 18.3, y: 5.3))
-        mark.line(to: NSPoint(x: 7.2, y: 5.3))
-        mark.stroke()
-        (template ? NSColor.black : NSColor(calibratedRed: 0.98, green: 0.37, blue: 0.77, alpha: 1)).setFill()
-        NSBezierPath(ovalIn: NSRect(x: 17.3, y: 16.65, width: 2.6, height: 2.6)).fill()
-        NSBezierPath(ovalIn: NSRect(x: 17.3, y: 4.7, width: 2.6, height: 2.6)).fill()
+        let ink = template ? NSColor.black : NSColor.white
+        ink.setStroke()
+        tile.lineWidth = 1.5
+        tile.lineJoinStyle = .miter
+        tile.stroke()
+        let mark = letter()
+        let bounds = mark.boundingBoxOfPath
+        let factor = 13.5 / bounds.height
+        var placement = CGAffineTransform(a: factor, b: 0, c: 0, d: factor,
+                                          tx: 12 - bounds.midX * factor, ty: 12 - bounds.midY * factor)
+        if let context = NSGraphicsContext.current?.cgContext,
+           let centered = mark.copy(using: &placement) {
+            context.setFillColor(ink.cgColor)
+            context.addPath(centered)
+            context.fillPath()
+        }
         image.unlockFocus()
         image.isTemplate = template
         return image
