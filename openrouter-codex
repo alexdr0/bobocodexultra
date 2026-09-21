@@ -138,6 +138,19 @@ def router_module():
     return sys.modules["bcu_router"]
 
 
+def games_module():
+    """Load offline games only when requested; routing never needs curses."""
+    if "bcu_games" not in sys.modules:
+        path = Path(__file__).resolve().with_name("bcu_games.py")
+        if not path.is_file():
+            raise SetupError("BCU games module is missing. Reinstall from the complete BCU folder.")
+        spec = importlib.util.spec_from_file_location("bcu_games", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["bcu_games"] = module
+        spec.loader.exec_module(module)
+    return sys.modules["bcu_games"]
+
+
 def mixed_controller():
     return router_module().Controller(paths()["home"])
 
@@ -1398,7 +1411,14 @@ def install() -> None:
         module_target = target.with_name("bcu_router.py")
         if module_target.exists() and not module_target.read_bytes().startswith(b'"""BCU local routing service'):
             raise SetupError("An unrelated bcu_router.py already exists beside the CLI.")
+        games_source = source.with_name("bcu_games.py")
+        if not games_source.is_file():
+            raise SetupError("Missing bcu_games.py; install from the complete BCU folder.")
+        games_target = target.with_name("bcu_games.py")
+        if games_target.is_symlink() or (games_target.exists() and not games_target.read_bytes().startswith(b'"""BCU terminal arcade')):
+            raise SetupError("An unrelated bcu_games.py already exists beside the CLI.")
         atomic_write(module_target, module.read_bytes())
+        atomic_write(games_target, games_source.read_bytes())
         atomic_write(target, source.read_bytes(), 0o700)
     if not alias.is_symlink():
         alias.symlink_to(target.name)
@@ -1438,6 +1458,12 @@ def docs(topic: str) -> None:
             ("codex smoke", "Optional billed read-only model call."),
             ("codex smoke --agents", "Optional billed read-only subagent check."),
         ],
+        "games": [
+            ("snake", "Eat food, grow, and avoid walls and your tail. Arrows/WASD steer; R restarts."),
+            ("pong", "Play first-to-seven against the CPU. Up/Down or W/S move; R rematches."),
+            ("doom", "Play BCU's original raycast maze shooter (no Doom assets). W/S move, A/D strafe, arrows turn, Space fires, M maps, R restarts."),
+            ("all games", "P pauses; Q or Esc quits. Offline, interactive UTF-8 terminal; no API key or model calls."),
+        ],
     }
     topics = sections if topic == "all" else {topic: sections[topic]}
     for label, commands in topics.items():
@@ -1454,8 +1480,9 @@ def docs(topic: str) -> None:
         UI.row("doctor", "Diagnose desktop routing without making a model call.")
         UI.row("status", "Check key, profile, catalog, desktop mode, and lineup.")
         UI.row("usage", "Exact locally recorded BCU tokens plus current-price cost estimates.")
+        UI.row("snake / pong / doom", "Play offline terminal arcade games; `docs games` shows controls.")
         UI.row("reset", "Alias for off.")
-        UI.row("docs [topic]", "Read these built-in docs; topics: auth, model, desktop, codex.")
+        UI.row("docs [topic]", "Read these built-in docs; topics: auth, model, desktop, codex, games.")
         UI.row("install", "Update both names in ~/.local/bin from this executable.")
         UI.row("ALIAS", "boboultracodex works identically to bobocodexultra.", "pink")
     UI.section("Safety")
@@ -1484,7 +1511,7 @@ def main() -> None:
         router_module().serve(paths()["home"])
         return
     parser = argparse.ArgumentParser(description="BCU: shared models for Codex Desktop.",
-                                     epilog="Everyday: login | on | off | models | sync | doctor | docs. Nested commands remain supported.")
+                                     epilog="Everyday: login | on | off | models | sync | doctor | docs | snake | pong | doom. Nested commands remain supported.")
     parser.add_argument("--no-color", action="store_true", help="Plain text output (also respects NO_COLOR)")
     parser.add_argument("--no-animate", action="store_true", help="Disable motion (also respects BOBOCODEXULTRA_NO_ANIM)")
     sub = parser.add_subparsers(dest="command")
@@ -1502,8 +1529,10 @@ def main() -> None:
     usage_parser.add_argument("--offline", action="store_true", help="Use cached pricing without contacting OpenRouter")
     sub.add_parser("reset", help="Alias for off: restore the previous desktop setup")
     sub.add_parser("install", help="Install both command names in ~/.local/bin")
+    for game in ("snake", "pong", "doom"):
+        sub.add_parser(game, help=f"Play {game.capitalize()} offline in the terminal")
     docs_parser = sub.add_parser("docs", help="Read built-in command documentation")
-    docs_parser.add_argument("topic", nargs="?", choices=("auth", "model", "desktop", "codex"), default="all")
+    docs_parser.add_argument("topic", nargs="?", choices=("auth", "model", "desktop", "codex", "games"), default="all")
     desktop_sub = sub.add_parser("desktop", help="Control shared desktop routing (shortcuts: on / off)").add_subparsers(dest="action", required=True)
     desktop_sub.add_parser("on", help="Enable ChatGPT, Ollama and BCU models side by side")
     desktop_sub.add_parser("off", help="Restore the previous native/Ollama desktop configuration")
@@ -1533,7 +1562,7 @@ def main() -> None:
         UI.motion = False
     if args.no_animate:
         UI.motion = False
-    if (args.command != "codex" or args.action != "launch") and not (args.command == "usage" and args.json):
+    if args.command not in ("snake", "pong", "doom") and (args.command != "codex" or args.action != "launch") and not (args.command == "usage" and args.json):
         UI.heading({"auth": "Secure access", "model": "Model selector", "desktop": "Desktop mode",
                     "codex": "Codex operations", "docs": "Field guide", "status": "System check",
                     "usage": "Token & cost ledger", "reset": "Native Codex reset",
@@ -1563,6 +1592,11 @@ def main() -> None:
             mixed_off()
         elif args.command == "install":
             install()
+        elif args.command in ("snake", "pong", "doom"):
+            try:
+                games_module().run(args.command)
+            except games_module().GameError as exc:
+                raise SetupError(str(exc)) from exc
         elif args.command == "model":
             model_commands(args)
         elif args.command == "desktop" and args.action == "on":

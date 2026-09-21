@@ -2,7 +2,7 @@
 
 BCU adds OpenRouter models alongside native ChatGPT and Ollama models in the **Codex desktop app**. It runs a local routing service and keeps Codex's built-in OpenAI provider and existing ChatGPT sign-in. It does not patch the signed desktop application.
 
-Requires macOS, the Codex desktop app, Python 3.14+ (for built-in zstd decompression), a working `codex` CLI on PATH, and an OpenRouter account/key. Check `python3 --version` before installing. Clone this repository, then:
+Requires macOS, the Codex desktop app, Python 3.14+ (for built-in zstd decompression), a working `codex` CLI on PATH, and an OpenRouter account/key. Check `python3 --version` before installing. Clone this repository and keep `openrouter-codex`, `bcu_router.py`, and `bcu_games.py` together, then:
 
 ```sh
 cd bobocodexultra
@@ -23,6 +23,9 @@ bobocodexultra off      # Restore the previous native/Ollama desktop setup
 bobocodexultra doctor   # Check the service, provider, endpoint and catalog
 bobocodexultra sync     # Refresh the combined catalog
 bobocodexultra docs     # Full built-in command guide
+bobocodexultra snake    # Offline terminal Snake
+bobocodexultra pong     # Offline terminal Pong against the CPU
+bobocodexultra doom     # Original terminal maze shooter
 ```
 
 Quit and reopen Codex after enabling/disabling shared mode or changing selected models. Codex loads its catalog at startup; existing tasks may keep earlier provider settings. BCU preserves the native default when enabling shared mode. Pick any native, Ollama or `(BCU)` model in the desktop selector.
@@ -32,6 +35,18 @@ Quit and reopen Codex after enabling/disabling shared mode or changing selected 
 The model TUI supports `/` search, `S` sort, arrows or J/K scrolling, Page Up/Down, Space multi-select, `D` default, `I` details, Enter save, and Q cancel. Changes are staged until saved. Labels are exactly `[Model Name] (BCU)`, for example `Grok 4.6 (BCU)`. Provider prefixes are removed from labels; request model IDs remain unchanged.
 
 The one-time login is interactive and uses a hidden Keychain prompt. For machines already signed in with BCU, `bobocodexultra on` is enough to activate shared mode. `bobocodexultra login` can also replace the saved key. Use `bobocodexultra auth login --no-desktop` if you only want to update the key.
+
+## Offline terminal arcade
+
+Run `bobocodexultra snake`, `bobocodexultra pong`, or `bobocodexultra doom` from any directory after installation. Games run locally in an interactive UTF-8 terminal, without login, an API key, the router, network access, or model charges. `boboultracodex` works too. Resize the terminal if prompted; press **P** to pause, **R** to restart, and **Q** or **Esc** to quit.
+
+| Game | Controls | Goal |
+| --- | --- | --- |
+| Snake | Arrow keys or WASD | Eat food; avoid walls and your tail. |
+| Pong | Up/Down or W/S | Beat the CPU to seven points. |
+| Doom | W/S forward/back; A/D strafe; Left/Right turn; Space shoot; M toggle map | Clear the maze of enemies while preserving health and ammo. |
+
+`doom` is a small original retro-style raycasting game, not id Software's Doom; it includes no Doom assets. See `bobocodexultra docs games` for the built-in controls. The arcade is separate from Codex Desktop's model selector and does not change provider settings.
 
 Optional shortcuts and existing command groups still work:
 

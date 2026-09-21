@@ -153,6 +153,8 @@ class OpenRouterCodexTests(unittest.TestCase):
             alias = primary.with_name("boboultracodex")
             self.assertTrue(primary.is_file())
             self.assertEqual(os.readlink(alias), primary.name)
+            self.assertEqual(primary.with_name("bcu_games.py").read_bytes(),
+                             TOOL.with_name("bcu_games.py").read_bytes())
             tool["install"]()
             self.assertEqual(primary.read_bytes(), TOOL.read_bytes())
 
