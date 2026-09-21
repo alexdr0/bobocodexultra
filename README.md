@@ -1,21 +1,35 @@
 # Bobo Codex Ultra — BCU
 
+![BCU circuit-B icon](assets/BCU-icon.png)
+
 BCU adds OpenRouter models alongside native ChatGPT and Ollama models in the **Codex desktop app**. It runs a local routing service and keeps Codex's built-in OpenAI provider and existing ChatGPT sign-in. It does not patch the signed desktop application.
 
-Requires macOS, the Codex desktop app, Python 3.14+ (for built-in zstd decompression), a working `codex` CLI on PATH, and an OpenRouter account/key. Check `python3 --version` before installing. Clone this repository and keep `openrouter-codex`, `bcu_router.py`, and `bcu_games.py` together, then:
+Shared desktop routing requires macOS, the Codex desktop app, Python 3.14+ (for built-in zstd decompression), a working `codex` CLI on PATH, and an OpenRouter account/key. Check `python3 --version`. Clone this repository and keep `openrouter-codex`, `bcu_router.py`, `bcu_games.py`, and `BCUStatus.swift` together when installing:
 
 ```sh
 cd bobocodexultra
 python3 openrouter-codex install
 bobocodexultra login
+bobocodexultra menu install
 ```
 
 `bobocodexultra` and its alias `boboultracodex` install into `~/.local/bin`. That directory must be on your PATH. Credentials are entered using macOS Keychain's secure terminal prompt; never put a key into a command argument or send it to an assistant.
+
+## macOS menu bar
+
+`bobocodexultra menu install` builds the native Swift companion into `~/Applications/Bobo Codex Ultra.app`, opens it, and enables Launch at Login using a per-user LaunchAgent. A small **circuit-B** appears in the menu bar: the monochrome template version adapts to dark/light menu bars, while the Applications icon uses a violet tile, cyan outline and pink status nodes. There is no Dock icon.
+
+The menu shows whether shared mode and its local router are available. Turn routing on/off, open a graphical **Manage Models** window, enter the OpenRouter key in Terminal's secure prompt, open Codex Desktop or the documentation, toggle Launch at Login, and **Quit BCU Menu** from the same icon. Quit closes only the menu app; it does not stop the request router or affect an active Codex task. The model window loads the OpenRouter tool-capable catalog, supports live search and sorting by popular/name/context/selected, shows your existing choices including models temporarily absent from OpenRouter, and allows multiple add/remove actions and default changes. Reopen Codex to refresh its selector after a model change.
+
+`bobocodexultra menu` opens the installed app (and installs it if necessary). Key entry always opens Terminal because Keychain's hidden interactive prompt needs a terminal. To stop launching at login, uncheck the menu item; to launch again after quitting, run `bobocodexultra menu`. The menu and router have independent login items: disabling one does not remove the other. The app is compiled and signed locally on your Mac; it uses only AppKit/SwiftUI and does not depend on a hosted menu process.
+
+See [Menu bar design and controls](docs/MENUBAR.md) for the icon rationale, state behavior, installation details and limitations.
 
 ## Everyday desktop controls
 
 ```sh
 bobocodexultra          # Compact desktop dashboard
+bobocodexultra menu     # Open the menu bar companion
 bobocodexultra login    # Store/replace the OpenRouter key and turn shared mode on
 bobocodexultra on       # Enable/repair shared desktop routing
 bobocodexultra models   # Search, scroll, sort and select models in the terminal TUI
@@ -120,6 +134,6 @@ The tests exercise real local HTTP sockets with fake upstreams: native body/auth
 python3 -m unittest discover -s tests -p 'test_*.py' -q
 ```
 
-The test suite does not require an API key or incur model charges. See [Contributing](CONTRIBUTING.md) for test and change guidelines, and [Security](SECURITY.md) for safe issue reporting.
+The test suite does not require an API key or incur model charges. See [Contributing](CONTRIBUTING.md) for development guidance and [Security](SECURITY.md) for safe issue reporting.
 
 References: [Codex configuration](https://learn.chatgpt.com/docs/config-file/config-reference), [Ollama's local router](https://github.com/ollama/ollama/blob/v0.34.2/internal/proxy/codex_desktop.go), [OpenRouter Responses API](https://openrouter.ai/docs/api_reference/responses/overview).

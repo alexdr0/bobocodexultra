@@ -16,6 +16,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import plistlib
 import re
 import shutil
 import stat
@@ -209,6 +210,7 @@ def desktop_home() -> None:
     runtime = router_module().health()
     UI.row("DESKTOP", "Shared models enabled" if control.state.exists() else "Native / BCU off", "mint")
     UI.row("ROUTER", "Running locally" if runtime.get("home") == str(paths()["home"]) else "Stopped")
+    UI.row("MENU", "bobocodexultra menu  ·  install/open the macOS menu bar app")
     UI.section("Everyday commands")
     for command, purpose in (("login", "Save your OpenRouter key securely"),
                              ("on", "Use ChatGPT, Ollama and BCU models side by side"),
@@ -1419,6 +1421,13 @@ def install() -> None:
             raise SetupError("An unrelated bcu_games.py already exists beside the CLI.")
         atomic_write(module_target, module.read_bytes())
         atomic_write(games_target, games_source.read_bytes())
+        menu_source = source.with_name("BCUStatus.swift")
+        if not menu_source.is_file():
+            raise SetupError("Missing BCUStatus.swift; install from the complete BCU folder.")
+        menu_target = target.with_name("BCUStatus.swift")
+        if menu_target.exists() and b"enum BCUIcon" not in menu_target.read_bytes()[:1024]:
+            raise SetupError("An unrelated BCUStatus.swift already exists beside the CLI.")
+        atomic_write(menu_target, menu_source.read_bytes())
         atomic_write(target, source.read_bytes(), 0o700)
     if not alias.is_symlink():
         alias.symlink_to(target.name)
@@ -1427,6 +1436,83 @@ def install() -> None:
         print("Add ~/.local/bin to PATH in your shell startup file, then open a new terminal.")
     else:
         UI.row("NEXT", "Run `bobocodexultra docs` from any directory.")
+
+
+def menu_install() -> None:
+    ensure_macos()
+    install()
+    source = Path(__file__).resolve().with_name("BCUStatus.swift")
+    bundle = Path.home() / "Applications" / "Bobo Codex Ultra.app"
+    contents = bundle / "Contents"
+    executable = contents / "MacOS" / "BCU Menu"
+    identifier = "com.bobocodexultra.menubar"
+    if bundle.is_symlink():
+        raise SetupError(f"{bundle} is a symlink; refusing to replace it.")
+    if bundle.exists():
+        info_path = contents / "Info.plist"
+        if not info_path.is_file() or plistlib.loads(info_path.read_bytes()).get("CFBundleIdentifier") != identifier:
+            raise SetupError(f"{bundle} is not a BCU installation; refusing to overwrite it.")
+    with tempfile.TemporaryDirectory(prefix="bcu-menu-") as folder:
+        staging = Path(folder)
+        built = staging / "BCU Menu"
+        result = subprocess.run(["/usr/bin/swiftc", "-O", "-framework", "AppKit", "-framework", "SwiftUI",
+                                 str(source), "-o", str(built)], capture_output=True, text=True, check=False)
+        if result.returncode:
+            raise SetupError("Could not compile BCU Menu:\n" + result.stderr[-3000:])
+        icon = staging / "BCU-icon.png"
+        rendered = subprocess.run([str(built), "--export-icon", str(icon)], capture_output=True, check=False)
+        if rendered.returncode or not icon.is_file():
+            raise SetupError("Could not render the BCU application icon.")
+        iconset = staging / "AppIcon.iconset"
+        iconset.mkdir()
+        for resolution in (16, 32, 128, 256, 512):
+            for multiplier in (1, 2):
+                destination = iconset / f"icon_{resolution}x{resolution}{'@2x' if multiplier == 2 else ''}.png"
+                resized = subprocess.run(["/usr/bin/sips", "-z", str(resolution * multiplier),
+                                          str(resolution * multiplier), str(icon), "--out", str(destination)],
+                                         capture_output=True, check=False)
+                if resized.returncode:
+                    raise SetupError("Could not resize the BCU application icon.")
+        packaged = staging / "AppIcon.icns"
+        if subprocess.run(["/usr/bin/iconutil", "-c", "icns", str(iconset), "-o", str(packaged)],
+                          capture_output=True, check=False).returncode:
+            raise SetupError("Could not package the BCU application icon.")
+        info = {"CFBundleIdentifier": identifier, "CFBundleName": "Bobo Codex Ultra",
+                "CFBundleDisplayName": "Bobo Codex Ultra", "CFBundleExecutable": "BCU Menu",
+                "CFBundlePackageType": "APPL", "CFBundleVersion": "1", "CFBundleShortVersionString": "1.0",
+                "CFBundleIconFile": "AppIcon", "LSUIElement": True, "NSHighResolutionCapable": True,
+                "NSMinimumSystemVersion": "13.0",
+                "NSAppTransportSecurity": {"NSAllowsLocalNetworking": True}}
+        atomic_write(contents / "Info.plist", plistlib.dumps(info))
+        atomic_write(executable, built.read_bytes(), 0o755)
+        atomic_write(contents / "Resources/AppIcon.icns", packaged.read_bytes())
+    signed = subprocess.run(["/usr/bin/codesign", "--force", "--deep", "--sign", "-", str(bundle)],
+                            capture_output=True, text=True, check=False)
+    if signed.returncode:
+        raise SetupError("App installed but local signing failed:\n" + signed.stderr[-1000:])
+    agent = Path.home() / "Library/LaunchAgents" / f"{identifier}.plist"
+    if agent.exists() and plistlib.loads(agent.read_bytes()).get("Label") != identifier:
+        raise SetupError(f"{agent} is not a BCU login item; refusing to overwrite it.")
+    entry = {"Label": identifier, "ProgramArguments": [str(executable)], "RunAtLoad": True,
+             "KeepAlive": False, "EnvironmentVariables": {"CODEX_HOME": str(paths()["home"])}}
+    atomic_write(agent, plistlib.dumps(entry))
+    launched = subprocess.run(["/usr/bin/open", "-a", str(bundle)], capture_output=True, text=True, check=False)
+    if launched.returncode:
+        raise SetupError("App installed and set to launch at login, but macOS could not open it: " + launched.stderr[-500:])
+    UI.done("BCU Menu is in the menu bar and will launch at login.")
+    UI.row("APP", str(bundle), "mint")
+    UI.row("TIP", "Quit BCU Menu from the icon; the model router keeps running until you turn it off.")
+
+
+def menu_open() -> None:
+    bundle = Path.home() / "Applications" / "Bobo Codex Ultra.app"
+    if not bundle.is_dir():
+        menu_install()
+        return
+    result = subprocess.run(["/usr/bin/open", "-a", str(bundle)], capture_output=True, check=False)
+    if result.returncode:
+        raise SetupError("macOS could not open BCU Menu. Run `bobocodexultra menu install` to repair it.")
+    UI.done("BCU Menu is open; find the circuit-B icon in the menu bar.")
 
 
 def docs(topic: str) -> None:
@@ -1452,6 +1538,8 @@ def docs(topic: str) -> None:
             ("on", "Start BCU locally and combine native, Ollama, and BCU models in Codex Desktop."),
             ("off", "Restore your previous desktop settings while preserving unrelated edits."),
             ("doctor", "Check the desktop endpoint, service, and combined catalog."),
+            ("menu", "Open or install the BCU macOS menu bar companion."),
+            ("menu install", "Build a signed local app, open it, and launch it automatically at login."),
         ],
         "codex": [
             ("codex launch", "Open Codex CLI with the OpenRouter profile."),
@@ -1478,6 +1566,7 @@ def docs(topic: str) -> None:
         UI.row("models", "Search, sort and choose multiple BCU models in the graphical terminal picker.")
         UI.row("sync", "Refresh the combined desktop model catalog.")
         UI.row("doctor", "Diagnose desktop routing without making a model call.")
+        UI.row("menu", "Control BCU from the macOS menu bar; opens or installs the companion app.")
         UI.row("status", "Check key, profile, catalog, desktop mode, and lineup.")
         UI.row("usage", "Exact locally recorded BCU tokens plus current-price cost estimates.")
         UI.row("snake / pong / doom", "Play offline terminal arcade games; `docs games` shows controls.")
@@ -1511,7 +1600,7 @@ def main() -> None:
         router_module().serve(paths()["home"])
         return
     parser = argparse.ArgumentParser(description="BCU: shared models for Codex Desktop.",
-                                     epilog="Everyday: login | on | off | models | sync | doctor | docs | snake | pong | doom. Nested commands remain supported.")
+                                     epilog="Everyday: menu | login | on | off | models | doctor | docs | snake | pong | doom.")
     parser.add_argument("--no-color", action="store_true", help="Plain text output (also respects NO_COLOR)")
     parser.add_argument("--no-animate", action="store_true", help="Disable motion (also respects BOBOCODEXULTRA_NO_ANIM)")
     sub = parser.add_subparsers(dest="command")
@@ -1523,7 +1612,9 @@ def main() -> None:
     auth_sub.add_parser("status", help="Check Keychain item presence without reading the key")
     sub.add_parser("status", help="Show complete configuration status")
     sub.add_parser("doctor", help="Check the shared desktop router and configuration")
-    usage_parser = sub.add_parser("usage", help="Report legacy OpenRouter CLI-profile tokens and estimated cost")
+    menu_parser = sub.add_parser("menu", help="Open or install the native macOS menu bar app")
+    menu_parser.add_argument("action", nargs="?", choices=("open", "install"), default="open")
+    usage_parser = sub.add_parser("usage", help="Report locally recorded BCU tokens and estimated cost")
     usage_parser.add_argument("--days", type=int, default=30, help="Lookback days; 0 means all retained history")
     usage_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     usage_parser.add_argument("--offline", action="store_true", help="Use cached pricing without contacting OpenRouter")
@@ -1566,7 +1657,7 @@ def main() -> None:
         UI.heading({"auth": "Secure access", "model": "Model selector", "desktop": "Desktop mode",
                     "codex": "Codex operations", "docs": "Field guide", "status": "System check",
                     "usage": "Token & cost ledger", "reset": "Native Codex reset",
-                    "doctor": "Desktop health", "install": "Command installer"}.get(args.command, "Codex Desktop"))
+                    "doctor": "Desktop health", "menu": "Menu bar", "install": "Command installer"}.get(args.command, "Codex Desktop"))
     try:
         if args.command is None:
             desktop_home()
@@ -1586,6 +1677,8 @@ def main() -> None:
             status()
         elif args.command == "doctor":
             doctor()
+        elif args.command == "menu":
+            menu_install() if args.action == "install" else menu_open()
         elif args.command == "usage":
             usage(args.days, args.json, args.offline)
         elif args.command == "reset":
