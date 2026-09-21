@@ -132,12 +132,112 @@ class OpenRouterCodexTests(unittest.TestCase):
 
     def test_named_and_legacy_commands_and_docs_work_without_a_key(self):
         for command, expected in ((["docs", "model"], "model add [author/model-id]"),
+                                  (["docs", "agents"], "agents setup"),
+                                  (["reasoning"], "anthropic/claude-opus-5"),
+                                  (["agents", "status"], "Codex default"),
                                   (["model", "list"], "anthropic/claude-opus-5"),
                                   (["models", "list"], "anthropic/claude-opus-5")):
             result = subprocess.run([sys.executable, str(TOOL), "--no-color", *command],
                                     text=True, capture_output=True, check=True)
             self.assertIn(expected, result.stdout)
             self.assertNotIn("\033[", result.stdout)
+
+    def test_reasoning_per_model_updates_selector_and_cli_profile(self):
+        chosen = tool["selection"]()
+        default = chosen["default"]
+        other = chosen["models"][0]["id"]
+        if other == default:
+            other = chosen["models"][1]["id"]
+        tool["reasoning_command"]("low", default)
+        tool["reasoning_command"]("medium", other)
+        chosen = tool["selection"]()
+        models = {m["slug"]: m for m in json.loads((self.home / "openrouter-codex-models.json").read_text())["models"]}
+        self.assertEqual(models[default]["default_reasoning_level"], "low")
+        self.assertEqual(models[other]["default_reasoning_level"], "medium")
+        self.assertEqual([level["effort"] for level in models[default]["supported_reasoning_levels"]],
+                         ["low", "medium", "high"])
+        self.assertEqual(tomllib.loads((self.home / "openrouter.config.toml").read_text())["model_reasoning_effort"], "low")
+        self.assertEqual(tool["manager_result"](chosen, {default}, default, [])['models'][0]['reasoning_effort'], "low")
+        staged = tool["manager_result"](chosen, {default}, default, [], {default: "medium"})
+        self.assertEqual(staged["models"][0]["reasoning_effort"], "medium")
+        self.assertEqual(tool["manager_result"](chosen, {default}, default, [])["models"][0]["reasoning_effort"], "low")
+        chosen["default"] = other
+        tool["update_selection"](chosen)
+        self.assertEqual(tomllib.loads((self.home / "openrouter.config.toml").read_text())["model_reasoning_effort"], "medium")
+        with self.assertRaises(tool["SetupError"]):
+            tool["reasoning_command"]("low", "unselected/model")
+
+    def test_reasoning_cli_persists_without_key_or_network(self):
+        result = subprocess.run([sys.executable, str(TOOL), "--no-color", "reasoning", "medium",
+                                 "--model", "anthropic/claude-opus-5"],
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        chosen = tool["selection"]()
+        self.assertEqual(tool["selected_effort"](chosen), "medium")
+        self.assertEqual(tomllib.loads((self.home / "openrouter.config.toml").read_text())["model_reasoning_effort"],
+                         "medium")
+
+    def test_agents_setup_and_restore_preserve_unrelated_codex_edits(self):
+        config = self.home / "config.toml"
+        config.write_text('model = "gpt-native"\nmodel_reasoning_effort = "xhigh"\n'
+                          '[agents]\nenabled = false\n# Keep my own agent notes\n'
+                          '[agents.reviewer]\ndescription = "private role"\n'
+                          '[desktop]\nappearance = "dark"\n')
+        tool["agents_command"]("setup", effort="medium", limit=3)
+        active = tomllib.loads(config.read_text())
+        self.assertEqual(active["model_reasoning_effort"], "xhigh")
+        self.assertEqual(active["agents"]["default_subagent_model"], tool["selection"]()["default"])
+        self.assertEqual(active["agents"]["default_subagent_reasoning_effort"], "medium")
+        self.assertEqual(active["agents"]["max_concurrent_threads_per_session"], 3)
+        self.assertTrue((self.home / "bcu/agents-state.json").exists())
+        tool["agents_command"]("setup", effort="low", limit=2)
+        config.write_text(config.read_text().replace('appearance = "dark"', 'appearance = "light"'))
+        tool["agents_command"]("restore")
+        restored = tomllib.loads(config.read_text())
+        self.assertFalse(restored["agents"]["enabled"])
+        self.assertNotIn("default_subagent_model", restored["agents"])
+        self.assertNotIn("default_subagent_reasoning_effort", restored["agents"])
+        self.assertNotIn("max_concurrent_threads_per_session", restored["agents"])
+        self.assertEqual(restored["desktop"]["appearance"], "light")
+        self.assertIn("# Keep my own agent notes", config.read_text())
+        self.assertFalse((self.home / "bcu/agents-state.json").exists())
+
+    def test_agents_refuse_to_overwrite_external_changes(self):
+        config = self.home / "config.toml"
+        config.write_text('[agents]\nmax_concurrent_threads_per_session = 5\n')
+        tool["agents_command"]("setup")
+        config.write_text(config.read_text().replace('max_concurrent_threads_per_session = 2',
+                                                      'max_concurrent_threads_per_session = 7'))
+        with self.assertRaises(tool["SetupError"]):
+            tool["agents_command"]("restore")
+        self.assertIn("max_concurrent_threads_per_session = 7", config.read_text())
+
+    def test_agents_setup_handles_missing_table_and_rejects_bad_model(self):
+        config = self.home / "config.toml"
+        config.write_text('model = "gpt-native"\n[agents.reviewer]\ndescription = "Reviewer"\n')
+        with self.assertRaises(tool["SetupError"]):
+            tool["agents_command"]("setup", "other/model")
+        tool["agents_command"]("setup")
+        self.assertTrue(tomllib.loads(config.read_text())["agents"]["enabled"])
+        tool["agents_command"]("restore")
+        self.assertNotIn("default_subagent_model", tomllib.loads(config.read_text())["agents"])
+
+    def test_off_restores_bcu_agent_defaults_and_removal_is_guarded(self):
+        config = self.home / "config.toml"
+        config.write_text('model = "gpt-native"\n[desktop]\nappearance = "dark"\n')
+        tool["agents_command"]("setup")
+        selected = tool["selection"]()
+        selected["models"] = [m for m in selected["models"] if m["id"] != selected["default"]]
+        selected["default"] = selected["models"][0]["id"]
+        with self.assertRaisesRegex(tool["SetupError"], "subagent default"):
+            tool["update_selection"](selected)
+        with patch.dict(tool["mixed_off"].__globals__, {"mixed_controller": lambda: type(
+                "StoppedRouter", (), {"disable": lambda self: None})()}):
+            tool["mixed_off"]()
+        restored = tomllib.loads(config.read_text())
+        self.assertNotIn("default_subagent_model", restored.get("agents", {}))
+        self.assertEqual(restored["desktop"]["appearance"], "dark")
+        self.assertFalse((self.home / "bcu/agents-state.json").exists())
 
     def test_manager_refuses_noninteractive_output_without_changes(self):
         result = subprocess.run([sys.executable, str(TOOL), "model", "manage"],

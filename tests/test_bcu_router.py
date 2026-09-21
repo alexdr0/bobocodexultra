@@ -208,6 +208,15 @@ class RouterTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_selected_reasoning_passes_through_and_excess_is_capped(self):
+        for effort in ("low", "medium", "high"):
+            payload, _ = bcu.normalize({"model": "author/model", "input": "test",
+                                        "reasoning": {"effort": effort, "summary": "auto"}})
+            self.assertEqual(payload["reasoning"], {"effort": effort})
+        payload, _ = bcu.normalize({"model": "author/model", "input": "test",
+                                    "reasoning": {"effort": "xhigh"}})
+        self.assertEqual(payload["reasoning"]["effort"], "high")
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

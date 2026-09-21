@@ -28,6 +28,7 @@ bobocodexultra --help
 ```sh
 bobocodexultra login    # Secure Keychain prompt; activates shared desktop mode
 bobocodexultra models   # Search and choose which BCU models appear
+bobocodexultra reasoning # View reasoning defaults for selected BCU models
 bobocodexultra doctor   # Check the local router and Codex integration
 ```
 
@@ -37,7 +38,18 @@ Credentials are entered using macOS Keychain's secure terminal prompt; never put
 
 ## Set up your Codex agents
 
-BCU routes model requests; Codex itself spawns and manages subagents. After selecting your models, edit your **user-level** `~/.codex/config.toml` (or `$CODEX_HOME/config.toml` if you use a custom Codex home). Add these settings to its existing `[agents]` table, or create the table once if none exists:
+BCU routes model requests; Codex itself spawns and manages subagents. After selecting your models, set up a selected BCU model as the default for children:
+
+```sh
+bobocodexultra agents setup                 # Selected default BCU model, its effort, limit 2
+bobocodexultra agents status                # Inspect effective user-level defaults
+bobocodexultra agents setup --model anthropic/claude-opus-5 --reasoning high --limit 3
+bobocodexultra agents restore               # Restore pre-BCU defaults; keep unrelated edits
+```
+
+Use `--model` only with an ID shown by `bobocodexultra model list`. BCU edits only the `[agents]` table in your **user-level** `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`), saves a private local backup, and refuses to overwrite agent settings changed outside BCU. `bobocodexultra off` also restores BCU-managed agent defaults so child agents do not keep pointing to a removed BCU route. Custom-agent files and explicit spawn settings can override these defaults.
+
+If you prefer to edit Codex settings yourself, add these settings to its existing `[agents]` table, or create the table once if none exists:
 
 ```toml
 [agents]
@@ -49,11 +61,25 @@ Multi-agent tools are enabled by default, but the explicit settings make your in
 
 ```toml
 default_subagent_model = "anthropic/claude-opus-5"
+default_subagent_reasoning_effort = "high"
 ```
 
 Leave `default_subagent_model` unset if you prefer Codex's own default. An explicit model chosen when spawning a child takes precedence. Do not paste the example model ID blindly: choose a model you have access to, and remember that a model shown in the selector is not a guarantee of tool compatibility. Do not create a second `[agents]` table or overwrite existing user settings. Keep provider and authentication settings in the user-level configuration rather than a project's `.codex/config.toml`.
 
-Reopen Codex, choose a `(BCU)` model, and try a small, read-only task asking Codex to delegate two independent checks to subagents and combine their findings. Then repeat with a native model if you want to verify both routes. Delegation still depends on the task's instructions and the selected model's tool behavior. As an **optional billed** CLI-only check, `bobocodexultra codex smoke --agents` exercises the separate OpenRouter CLI profile; it does not validate every Codex Desktop workflow. See the [official Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference#configtoml) for the current agent settings.
+Reopen Codex, choose a `(BCU)` model, and try a small, read-only task asking Codex to delegate two independent checks to subagents and combine their findings. Then repeat with a native model if you want to verify both routes. Delegation still depends on the task's instructions and the selected model's tool behavior. As an **optional billed** CLI-only check, `bobocodexultra codex smoke --agents` exercises the separate OpenRouter CLI profile; it does not validate every Codex Desktop workflow. See the [official Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference#configtoml) and [subagent guide](https://learn.chatgpt.com/docs/agent-configuration/subagents#custom-agents) for current settings and custom roles.
+
+## Control reasoning difficulty
+
+Each selected BCU model can have its own default. BCU advertises low, medium, and high choices to Codex Desktop and saves the selected default in its catalog; the dedicated BCU CLI profile also follows the selected default model's effort. This does **not** change native ChatGPT/Ollama model metadata or their reasoning settings.
+
+```sh
+bobocodexultra reasoning                               # Show every selected BCU model's default
+bobocodexultra reasoning medium                        # Change the default BCU model
+bobocodexultra reasoning low --model anthropic/claude-opus-5
+bobocodexultra doctor                                  # Inspect config and possible overrides
+```
+
+Relaunch Codex to refresh the selector. A user-level `model_reasoning_effort` or a task's explicit effort may override the catalog default; `doctor` displays a global effort if present. The router forwards low/medium/high on BCU requests but caps incoming `xhigh`, `max`, or `ultra` to `high` for its OpenRouter route. Provider support varies, so test a short task when changing effort; an upstream model can reject an unsupported value. BCU never rewrites native model entries to force these options.
 
 ## macOS menu bar
 
@@ -73,6 +99,8 @@ bobocodexultra menu     # Open the menu bar companion
 bobocodexultra login    # Store/replace the OpenRouter key and turn shared mode on
 bobocodexultra on       # Enable/repair shared desktop routing
 bobocodexultra models   # Search, scroll, sort and select models in the terminal TUI
+bobocodexultra reasoning medium # Default effort for the selected default BCU model
+bobocodexultra agents setup     # Set up Codex subagents with reversible defaults
 bobocodexultra off      # Restore the previous native/Ollama desktop setup
 bobocodexultra doctor   # Check the service, provider, endpoint and catalog
 bobocodexultra sync     # Refresh the combined catalog
@@ -86,7 +114,7 @@ Quit and reopen Codex after enabling/disabling shared mode or changing selected 
 
 `on` starts a per-user macOS LaunchAgent, which restarts the router after a crash and starts it at login. No root or sudo is required. `off` restores the previous endpoint/catalog/provider and retains unrelated settings changed afterward. Recovery backups are retained. The listener remains available for already-open tasks until they reload; turning off desktop routing does not delete credentials, selections, or usage data.
 
-The model TUI supports `/` search, `S` sort, arrows or J/K scrolling, Page Up/Down, Space multi-select, `D` default, `I` details, Enter save, and Q cancel. Changes are staged until saved. Labels are exactly `[Model Name] (BCU)`, for example `Grok 4.6 (BCU)`. Provider prefixes are removed from labels; request model IDs remain unchanged.
+The model TUI supports `/` search, `S` sort, arrows or J/K scrolling, Page Up/Down, Space multi-select, `D` default, `R` cycle low/medium/high reasoning, `I` details, Enter save, and Q cancel. Changes are staged until saved. Labels are exactly `[Model Name] (BCU)`, for example `Grok 4.6 (BCU)`. Provider prefixes are removed from labels; request model IDs remain unchanged.
 
 The one-time login is interactive and uses a hidden Keychain prompt. For machines already signed in with BCU, `bobocodexultra on` is enough to activate shared mode. `bobocodexultra login` can also replace the saved key. Use `bobocodexultra auth login --no-desktop` if you only want to update the key.
 

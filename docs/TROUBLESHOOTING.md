@@ -18,6 +18,14 @@ BCU requires Python 3.14+, the macOS desktop login session, and a free local por
 
 Use `bobocodexultra auth status` to check Keychain presence without printing the key. Verify model access and account balance directly in OpenRouter. A selected model may lack full Responses API, tool, or subagent compatibility even when OpenRouter lists it as tool-capable. Start with a short task. An upstream 429 is a rate limit, not evidence that the local router selected the wrong provider.
 
+## Reasoning choice does not seem to take effect
+
+Run `bobocodexultra reasoning` to inspect each selected BCU model's default, then change one with `bobocodexultra reasoning medium --model author/model-id` and relaunch Codex. `bobocodexultra doctor` shows whether a user-level `model_reasoning_effort` may override the catalog default. Explicit task or custom-agent settings can also win. The BCU OpenRouter route caps `xhigh`, `max`, and `ultra` requests at `high`; this does not affect native/Ollama requests. If a provider rejects a lower effort, try another selected model or return that model to `high`.
+
+## Subagents use the wrong model after changing the selection
+
+Run `bobocodexultra agents status` and `bobocodexultra model list`. If a BCU-managed default points to a model you want to remove, run `bobocodexultra agents setup --model NEW_SELECTED_ID` first, or `bobocodexultra agents restore`. `bobocodexultra off` restores BCU-managed agent defaults automatically when they have not been changed externally. If the agent settings were edited manually, BCU refuses to overwrite them and reports that a manual merge is needed. Explicit spawn options and custom-agent files override the global defaults.
+
 ## Switching models in a long task fails
 
 If the task contains provider-specific compacted or encrypted reasoning history, make a new task with a visible summary. BCU does not translate native compaction to OpenRouter. A newly saved selection also needs a Codex restart to appear in the menu.

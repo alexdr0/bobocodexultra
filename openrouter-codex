@@ -45,6 +45,7 @@ MODELS = (
 )
 SLUGS = tuple(row[0] for row in MODELS)
 MODEL_ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._+-]*/[a-zA-Z0-9][a-zA-Z0-9._:+-]*$")
+REASONING_LEVELS = ("low", "medium", "high")
 MANAGED_KEYS = ("model", "model_provider", "model_catalog_json", "model_reasoning_effort")
 START_MARKER = "# BEGIN openrouter-codex provider (managed; do not edit)"
 END_MARKER = "# END openrouter-codex provider"
@@ -184,6 +185,11 @@ def mixed_off() -> None:
     control.disable()
     if paths()["state"].exists():
         native_reset()
+    if agents_state_path().exists():
+        try:
+            agents_command("restore")
+        except SetupError as exc:
+            UI.row("AGENTS NOTICE", f"Agent defaults need a manual merge: {exc}", "amber")
     UI.done("BCU desktop routing is off. Your previous native/Ollama setup is restored.")
     UI.row("NEXT", "Quit and reopen Codex. Already-open tasks retain their previous endpoint until then.")
 
@@ -198,6 +204,14 @@ def doctor() -> None:
     UI.row("PROVIDER", parsed.get("model_provider", "openai"))
     UI.row("ENDPOINT", parsed.get("openai_base_url", "OpenAI default"))
     UI.row("KEYCHAIN", "ready" if key_exists() else "missing / locked")
+    chosen = selection()
+    UI.row("BCU REASONING", f"{chosen['default']}: {selected_effort(chosen)} (selector default)")
+    agents = parsed.get("agents", {})
+    if isinstance(agents, dict):
+        UI.row("SUBAGENTS", f"{agents.get('default_subagent_model', 'Codex default')} · "
+               f"{agents.get('default_subagent_reasoning_effort', 'model default')} effort")
+    if parsed.get("model_reasoning_effort"):
+        UI.row("GLOBAL EFFORT", f"{parsed['model_reasoning_effort']} (may override BCU model defaults)", "amber")
     if control.catalog.exists():
         UI.row("CATALOG", f"{len(json.loads(control.catalog.read_text())['models'])} combined models")
     if runtime:
@@ -215,6 +229,8 @@ def desktop_home() -> None:
     for command, purpose in (("login", "Save your OpenRouter key securely"),
                              ("on", "Use ChatGPT, Ollama and BCU models side by side"),
                              ("models", "Search and choose BCU models"),
+                             ("reasoning", "Set per-model BCU reasoning difficulty"),
+                             ("agents", "Set up Codex subagent defaults"),
                              ("off", "Return to your previous desktop setup"),
                              ("doctor", "Check and troubleshoot desktop routing"),
                              ("docs", "Read the full command guide")):
@@ -366,13 +382,19 @@ def selection() -> dict:
         or not MODEL_ID.fullmatch(m["id"])
         or not isinstance(m.get("name"), str)
         or not isinstance(m.get("context_length"), int) or m["context_length"] < 8192
-        or not isinstance(m.get("images"), bool) for m in models
+        or not isinstance(m.get("images"), bool)
+        or m.get("reasoning_effort", "high") not in REASONING_LEVELS for m in models
     ):
         raise SetupError(f"Invalid model selection in {path}")
     ids = [m["id"] for m in models]
     if len(set(ids)) != len(ids) or value.get("default") not in ids:
         raise SetupError(f"Invalid or duplicate models/default in {path}")
     return value
+
+
+def selected_effort(chosen: dict, model_id: str | None = None) -> str:
+    model_id = model_id or chosen["default"]
+    return next(m.get("reasoning_effort", "high") for m in chosen["models"] if m["id"] == model_id)
 
 
 def catalog_bytes(home: Path, selected: dict | None = None) -> bytes:
@@ -388,9 +410,10 @@ def catalog_bytes(home: Path, selected: dict | None = None) -> bytes:
             "description": "OpenRouter Responses API model; verify tool behavior before sensitive work.",
             "context_window": context,
             "max_context_window": context,
-            "default_reasoning_level": "high",
+            "default_reasoning_level": chosen.get("reasoning_effort", "high"),
             "supported_reasoning_levels": [
-                {"effort": "high", "description": "High reasoning for agentic work"}
+                {"effort": effort, "description": f"{effort.capitalize()} reasoning effort"}
+                for effort in REASONING_LEVELS
             ],
             "input_modalities": ["text", "image"] if images else ["text"],
             "visibility": "list",
@@ -423,13 +446,13 @@ def provider_toml() -> str:
     )
 
 
-def profile_bytes(catalog: Path, default: str = DEFAULT_MODEL) -> bytes:
+def profile_bytes(catalog: Path, default: str = DEFAULT_MODEL, effort: str = "high") -> bytes:
     return (
         f"# OpenRouter profile created by openrouter-codex. No credentials here.\n"
         f"model = {json.dumps(default)}\n"
         'model_provider = "openrouter"\n'
         f"model_catalog_json = {json.dumps(str(catalog))}\n"
-        'model_reasoning_effort = "high"\n'
+        f'model_reasoning_effort = {json.dumps(effort)}\n'
         'service_tier = "default"\n\n'
         "[agents]\n"
         "enabled = true\n"
@@ -444,7 +467,7 @@ def prepare(refresh: bool = False) -> dict[str, Path]:
     p["home"].mkdir(mode=0o700, parents=True, exist_ok=True)
     chosen = selection()
     catalog = catalog_bytes(p["home"], chosen)
-    profile = profile_bytes(p["catalog"], chosen["default"])
+    profile = profile_bytes(p["catalog"], chosen["default"], selected_effort(chosen))
     tomllib.loads(profile.decode())
     if not refresh:
         verify_managed(chosen, p)
@@ -555,7 +578,8 @@ def manager_view(available: list[dict], selected: set[str], query: str, sort_mod
     return sorted(visible, key=lambda m: m["_rank"])
 
 
-def manager_result(chosen: dict, selected: set[str], default: str, available: list[dict]) -> dict:
+def manager_result(chosen: dict, selected: set[str], default: str, available: list[dict],
+                   reasoning: dict[str, str] | None = None) -> dict:
     if not selected:
         raise SetupError("Choose at least one model before saving.")
     by_id = {m["id"]: m for m in available}
@@ -566,6 +590,9 @@ def manager_result(chosen: dict, selected: set[str], default: str, available: li
     result = copy.deepcopy(chosen)
     result["models"] = [copy.deepcopy(prior_records[slug]) if slug in prior_records
                         else model_record(by_id[slug]) for slug in order]
+    for record in result["models"]:
+        if reasoning and record["id"] in reasoning:
+            record["reasoning_effort"] = reasoning[record["id"]]
     result["default"] = default if default in selected else order[0]
     return result
 
@@ -624,6 +651,11 @@ def model_manager(chosen: dict, query: str = "", sort_mode: str = "popular") -> 
                 pass
 
         staged = set(selected)
+        current_reasoning = {m["id"]: m.get("reasoning_effort", "high") for m in chosen["models"]}
+        staged_reasoning = {}
+
+        def effort_for(slug: str) -> str:
+            return staged_reasoning.get(slug, current_reasoning.get(slug, "high"))
         default = chosen["default"]
         search = safe_text(query, 100)
         editing = False
@@ -655,6 +687,7 @@ def model_manager(chosen: dict, query: str = "", sort_mode: str = "popular") -> 
                     "PgUp/PgDn, G, Shift+G    Jump through long lists",
                     "Space  Toggle the highlighted model; select as many as you like",
                     "D      Make the highlighted model your default (selects it too)",
+                    "R      Cycle low / medium / high reasoning for the highlighted model",
                     "X      Remove the highlighted model from your selection",
                     "I/Tab  Open full model details (also useful in narrow terminals)",
                     "Enter  Save all staged changes to the Codex selector",
@@ -687,6 +720,7 @@ def model_manager(chosen: dict, query: str = "", sort_mode: str = "popular") -> 
                     "Tool calling: " + ("not currently listed" if model.get("_unavailable") else "advertised"),
                     "Selected: " + ("yes" if model["id"] in staged else "no"),
                     "Default: " + ("yes" if model["id"] == default else "no"), "",
+                    "Reasoning: " + effort_for(model["id"]),
                     "ABOUT",
                     *textwrap.wrap(safe_text(model.get("description"), 600), max(25, columns - 7)),
                 ]
@@ -727,7 +761,8 @@ def model_manager(chosen: dict, query: str = "", sort_mode: str = "popular") -> 
                 badge = "★" if slug == default else ("◆" if slug in staged else "◇")
                 name = safe_text(model.get("name")) or slug
                 unavailable = " [unlisted]" if model.get("_unavailable") else ""
-                line = f"{badge} {name}  ·  {slug}{unavailable}"
+                effort_badge = f" [{effort_for(slug)}]" if slug in staged else ""
+                line = f"{badge} {name}{effort_badge}  ·  {slug}{unavailable}"
                 attr = color(3 if slug in staged else 2)
                 if index == cursor:
                     attr = color(1, curses.A_REVERSE | curses.A_BOLD)
@@ -753,6 +788,7 @@ def model_manager(chosen: dict, query: str = "", sort_mode: str = "popular") -> 
                         ("INPUT", ", ".join((model.get("architecture") or {}).get("input_modalities") or []) or "unknown"),
                         ("TOOLS", "advertised" if not model.get("_unavailable") else "not currently listed"),
                         ("STATE", "selected" if slug in staged else "not selected"),
+                        ("REASONING", effort_for(slug)),
                     ]
                     y = 6
                     for label, value in details:
@@ -771,7 +807,7 @@ def model_manager(chosen: dict, query: str = "", sort_mode: str = "popular") -> 
                             draw(line_number, detail_x, wrapped, detail_width)
 
             draw(height - 4, 1, "─" * (columns - 3), columns - 2, color(1))
-            draw(height - 3, 2, "SPACE toggle    D default    / search    S sort    I details    ? help", columns - 4, color(2))
+            draw(height - 3, 2, "SPACE toggle    D default    R reasoning    / search    S sort    ? help", columns - 4, color(2))
             draw(height - 2, 2, "↑↓/JK scroll    PgUp/PgDn jump    ENTER save    Q cancel", columns - 4, color(3))
             notice = ("Config edited: desktop off needs a manual merge.  " if dirty_config else "") + message
             draw(height - 1, 2, notice, columns - 4, color(4))
@@ -818,6 +854,12 @@ def model_manager(chosen: dict, query: str = "", sort_mode: str = "popular") -> 
                 cursor = 0
             elif key in ("G", curses.KEY_END):
                 cursor = max(0, len(visible) - 1)
+            elif key in ("r", "R") and visible:
+                slug = visible[cursor]["id"]
+                staged.add(slug)
+                old_effort = effort_for(slug)
+                staged_reasoning[slug] = REASONING_LEVELS[(REASONING_LEVELS.index(old_effort) + 1) % len(REASONING_LEVELS)]
+                message = f"{slug}: {staged_reasoning[slug]} reasoning staged; Enter saves."
             elif key in (" ", "x", "X", "d", "D") and visible:
                 slug = visible[cursor]["id"]
                 if key in ("d", "D"):
@@ -836,7 +878,7 @@ def model_manager(chosen: dict, query: str = "", sort_mode: str = "popular") -> 
                 if not staged:
                     message = "Select at least one model before saving."
                 else:
-                    return manager_result(chosen, staged, default, available)
+                    return manager_result(chosen, staged, default, available, staged_reasoning)
 
     try:
         updated = curses.wrapper(screen)
@@ -860,7 +902,13 @@ def update_selection(chosen: dict) -> None:
     ids = [m["id"] for m in chosen["models"]]
     if not ids or len(set(ids)) != len(ids) or chosen["default"] not in ids:
         raise SetupError("Choose at least one unique model and a default from that selection.")
-    catalog, profile = catalog_bytes(p["home"], chosen), profile_bytes(p["catalog"], chosen["default"])
+    if p["config"].exists():
+        current_agents = tomllib.loads(p["config"].read_text()).get("agents", {})
+        agent_model = current_agents.get("default_subagent_model") if isinstance(current_agents, dict) else None
+        if agent_model in {m["id"] for m in old["models"]} and agent_model not in ids:
+            raise SetupError("This model is the Codex subagent default. Run `agents setup --model NEW_ID` "
+                             "or `agents restore` before removing it.")
+    catalog, profile = catalog_bytes(p["home"], chosen), profile_bytes(p["catalog"], chosen["default"], selected_effort(chosen))
     tomllib.loads(profile.decode())
     active = None
     desktop_state = None
@@ -914,7 +962,7 @@ def sync_selection_artifacts() -> None:
     chosen = selection()
     verify_managed(chosen, p)
     catalog = catalog_bytes(p["home"], chosen)
-    profile = profile_bytes(p["catalog"], chosen["default"])
+    profile = profile_bytes(p["catalog"], chosen["default"], selected_effort(chosen))
     tomllib.loads(profile.decode())
     for label, data in (("catalog", catalog), ("profile", profile)):
         if p[label].exists() and p[label].read_bytes() == data:
@@ -942,7 +990,8 @@ def model_commands(args: argparse.Namespace) -> None:
         for m in chosen["models"]:
             star = "★" if m["id"] == chosen["default"] else "·"
             print("  " + UI.paint(star, "amber" if star == "★" else "violet") + " " +
-                  UI.paint(m["id"], "cyan") + UI.paint("  /  " + safe_text(m["name"]), "dim"))
+                  UI.paint(m["id"], "cyan") + UI.paint("  /  " + safe_text(m["name"]) +
+                  "  ·  reasoning " + m.get("reasoning_effort", "high"), "dim"))
         UI.row("★ DEFAULT", "Desktop OpenRouter mode exposes this selected list.", "amber")
     elif args.action == "search":
         available = openrouter_models(args.query, 40)
@@ -975,6 +1024,152 @@ def model_commands(args: argparse.Namespace) -> None:
         update_selection(chosen)
     elif args.action == "sync":
         sync_selection_artifacts()
+
+
+def reasoning_command(effort: str | None, model_id: str | None) -> None:
+    chosen = selection()
+    if effort is None:
+        UI.section("BCU model reasoning")
+        shown = [m for m in chosen["models"] if not model_id or m["id"] == model_id]
+        if not shown:
+            raise SetupError("Choose a selected BCU model ID from `bobocodexultra model list`.")
+        for model in shown:
+            suffix = " (default)" if model["id"] == chosen["default"] else ""
+            UI.row(model["id"], model.get("reasoning_effort", "high") + suffix)
+        UI.row("LEVELS", "low / medium / high; an upstream model may reject unsupported effort.", "amber")
+        UI.row("NATIVE", "Native and Ollama reasoning settings are not changed by BCU.")
+        return
+    target = model_id or chosen["default"]
+    record = next((m for m in chosen["models"] if m["id"] == target), None)
+    if record is None:
+        raise SetupError("Choose a selected BCU model ID from `bobocodexultra model list`.")
+    if record.get("reasoning_effort", "high") == effort:
+        UI.done(f"{target} already uses {effort} reasoning.")
+        return
+    record["reasoning_effort"] = effort
+    update_selection(chosen)
+    UI.done(f"{target}: default reasoning set to {effort}.")
+    UI.row("DESKTOP", "Relaunch Codex to refresh reasoning choices; existing tasks may retain their effort.")
+
+
+AGENT_KEYS = ("enabled", "max_concurrent_threads_per_session",
+              "default_subagent_model", "default_subagent_reasoning_effort")
+
+
+def agents_state_path() -> Path:
+    return paths()["home"] / "bcu" / "agents-state.json"
+
+
+def patch_agents_table(original: str, updates: dict) -> str:
+    """Change only simple keys in [agents], preserving other Codex settings."""
+    if set(updates) - set(AGENT_KEYS):
+        raise SetupError("Unexpected agents setting.")
+    parsed = tomllib.loads(original)
+    lines = original.splitlines(keepends=True)
+    headers = [(i, line.strip()) for i, line in enumerate(lines)
+               if re.match(r"^\s*\[", line)]
+    direct = [i for i, line in headers if re.match(r"^\[agents\](?:\s*(?:#.*)?)$", line)]
+    if len(direct) > 1:
+        raise SetupError("Duplicate [agents] tables; edit your Codex config manually.")
+    if not direct:
+        if "agents" in parsed and not any(line.startswith("[agents.") for _, line in headers):
+            raise SetupError("Unsupported inline agents config; edit it manually.")
+        insert_at = next((i for i, line in headers if line.startswith("[agents.")), len(lines))
+        values = "".join(f"{key} = {json.dumps(value)}\n" for key, value in updates.items() if value is not None)
+        prefix = "" if not original else "\n" if original.endswith("\n") else "\n\n"
+        if insert_at < len(lines):
+            prefix = "" if insert_at == 0 else "\n" if lines[insert_at - 1].endswith("\n") else "\n\n"
+        lines[insert_at:insert_at] = [prefix + "[agents]\n" + values + "\n"]
+    else:
+        start = direct[0]
+        end = next((i for i, _ in headers if i > start), len(lines))
+        seen = set()
+        block = []
+        for line in lines[start + 1:end]:
+            match = re.match(r"^\s*([a-zA-Z_][\w]*)\s*=", line)
+            key = match.group(1) if match else None
+            if key in updates:
+                if key in seen:
+                    raise SetupError(f"Duplicate agents setting: {key}.")
+                seen.add(key)
+                if updates[key] is not None:
+                    block.append(f"{key} = {json.dumps(updates[key])}\n")
+            else:
+                block.append(line)
+        if block and not block[-1].endswith("\n"):
+            block[-1] += "\n"
+        block.extend(f"{key} = {json.dumps(value)}\n" for key, value in updates.items()
+                     if key not in seen and value is not None)
+        lines[start + 1:end] = block
+    result = "".join(lines)
+    agents = tomllib.loads(result).get("agents", {})
+    if any((key in agents if value is None else agents.get(key) != value)
+           for key, value in updates.items()):
+        raise SetupError("Could not safely update [agents] without changing other Codex settings.")
+    return result
+
+
+def agents_command(action: str, model_id: str | None = None,
+                   effort: str | None = None, limit: int = 2) -> None:
+    config = paths()["config"]
+    state_path = agents_state_path()
+    if config.is_symlink() or state_path.is_symlink():
+        raise SetupError("Codex config or BCU agent state is a symlink; refusing to replace it.")
+    original = config.read_bytes() if config.exists() else b""
+    parsed = tomllib.loads(original.decode())
+    existing = parsed.get("agents", {})
+    if not isinstance(existing, dict):
+        raise SetupError("Codex [agents] settings are not a table.")
+    if action == "status":
+        UI.section("Codex agents")
+        UI.row("ENABLED", str(existing.get("enabled", True)))
+        UI.row("MODEL", existing.get("default_subagent_model", "Codex default"))
+        UI.row("REASONING", existing.get("default_subagent_reasoning_effort", "Model default"))
+        UI.row("LIMIT", str(existing.get("max_concurrent_threads_per_session", "Codex default")))
+        UI.row("BCU SETUP", "managed; `agents restore` can undo it" if state_path.exists() else "not managed")
+        return
+    if action == "setup":
+        if paths()["state"].exists():
+            raise SetupError("Legacy desktop mode is active. Run `off` then `on` before editing agent settings.")
+        if not 1 <= limit <= 16:
+            raise SetupError("Agent concurrency must be between 1 and 16.")
+        chosen = selection()
+        target = model_id or chosen["default"]
+        if target not in {m["id"] for m in chosen["models"]}:
+            raise SetupError("First select this BCU model with `bobocodexultra models`.")
+        updates = {"enabled": True, "max_concurrent_threads_per_session": limit,
+                   "default_subagent_model": target,
+                   "default_subagent_reasoning_effort": effort or selected_effort(chosen, target)}
+        if state_path.exists():
+            state = json.loads(state_path.read_text())
+            if any(existing.get(key) != value for key, value in state["managed"].items()):
+                raise SetupError("Agent settings changed outside BCU; resolve those edits before running setup again.")
+        else:
+            state = {"original": {key: existing.get(key) for key in AGENT_KEYS}}
+        modified = patch_agents_table(original.decode(), updates).encode()
+        if config.exists() and config.read_bytes() != original:
+            raise SetupError("Codex config changed during setup; retry to preserve those changes.")
+        backup = paths()["home"] / "bcu" / "backups" / f"agents-{time.time_ns()}.toml"
+        atomic_write(backup, original)
+        atomic_write(config, modified, stat.S_IMODE(config.stat().st_mode) if config.exists() else 0o600)
+        state["managed"] = updates
+        atomic_write(state_path, (json.dumps(state, indent=2) + "\n").encode())
+        UI.done(f"Codex agents configured: {target} at {updates['default_subagent_reasoning_effort']} (limit {limit}).")
+        UI.row("BACKUP", str(backup))
+        UI.row("NEXT", "Relaunch Codex; explicit spawn settings or custom-agent files can override these defaults.")
+        return
+    if not state_path.exists():
+        UI.done("No BCU-managed agent setup to restore.")
+        return
+    state = json.loads(state_path.read_text())
+    if any(existing.get(key) != value for key, value in state["managed"].items()):
+        raise SetupError("Agent settings changed outside BCU; refusing to overwrite them. Use the saved backup to merge manually.")
+    restored = patch_agents_table(original.decode(), state["original"]).encode()
+    if config.read_bytes() != original:
+        raise SetupError("Codex config changed during restore; retry.")
+    atomic_write(config, restored, stat.S_IMODE(config.stat().st_mode))
+    state_path.unlink()
+    UI.done("Previous Codex agent settings restored; unrelated config edits retained.")
 
 
 def replace_root_keys(original: str, updates: dict[str, str]) -> str:
@@ -1152,6 +1347,8 @@ def status() -> None:
         UI.row("CONFIG CLEAN", str(bool(p["config"].exists() and
                                         sha(p["config"].read_bytes()) == state["active_sha256"])))
     UI.row("MODELS", ", ".join(m["id"] for m in selection()["models"]))
+    UI.row("BCU REASONING", ", ".join(m["id"] + ":" + m.get("reasoning_effort", "high")
+                                     for m in selection()["models"]))
 
 
 def parse_utc(value: object) -> datetime | None:
@@ -1525,7 +1722,7 @@ def docs(topic: str) -> None:
         ],
         "model": [
             ("model", "Open the model manager directly."),
-            ("model manage", "Full-screen picker: / search, S sort, arrows scroll, Space multi-select, Enter save, Q cancel."),
+            ("model manage", "Full-screen picker: / search, S sort, arrows scroll, Space multi-select, R reasoning, Enter save, Q cancel."),
             ("model list", "Show your selected lineup and default."),
             ('model search "claude"', "Browse current tool-capable OpenRouter models."),
             ('model select "claude"', "Open the TUI with an initial search (optional); I shows details."),
@@ -1533,6 +1730,12 @@ def docs(topic: str) -> None:
             ("model remove [author/model-id]", "Open the TUI, or remove one exact ID."),
             ("model default [author/model-id]", "Open the TUI, or choose one exact default ID."),
             ("model sync", "Regenerate selector labels; selected models end with (BCU)."),
+            ("reasoning [low|medium|high] [--model ID]", "Show or set a BCU model's default reasoning and selector levels."),
+        ],
+        "agents": [
+            ("agents status", "Show current Codex subagent defaults without exposing credentials."),
+            ("agents setup [--model ID] [--reasoning LEVEL] [--limit N]", "Configure selected BCU model as the user-level subagent default."),
+            ("agents restore", "Restore previous agent defaults while preserving other Codex config edits."),
         ],
         "desktop": [
             ("on", "Start BCU locally and combine native, Ollama, and BCU models in Codex Desktop."),
@@ -1564,6 +1767,8 @@ def docs(topic: str) -> None:
         UI.row("login", "Securely enter your OpenRouter key and enable the shared desktop selector.")
         UI.row("on / off", "Enable shared desktop mode or return to your previous setup.")
         UI.row("models", "Search, sort and choose multiple BCU models in the graphical terminal picker.")
+        UI.row("reasoning", "Choose low, medium, or high reasoning per BCU model.")
+        UI.row("agents", "Configure and restore Codex subagent defaults safely.")
         UI.row("sync", "Refresh the combined desktop model catalog.")
         UI.row("doctor", "Diagnose desktop routing without making a model call.")
         UI.row("menu", "Control BCU from the macOS menu bar; opens or installs the companion app.")
@@ -1571,7 +1776,7 @@ def docs(topic: str) -> None:
         UI.row("usage", "Exact locally recorded BCU tokens plus current-price cost estimates.")
         UI.row("snake / pong / doom", "Play offline terminal arcade games; `docs games` shows controls.")
         UI.row("reset", "Alias for off.")
-        UI.row("docs [topic]", "Read these built-in docs; topics: auth, model, desktop, codex, games.")
+        UI.row("docs [topic]", "Read these built-in docs; topics: auth, model, agents, desktop, codex, games.")
         UI.row("install", "Update both names in ~/.local/bin from this executable.")
         UI.row("ALIAS", "boboultracodex works identically to bobocodexultra.", "pink")
     UI.section("Safety")
@@ -1600,7 +1805,7 @@ def main() -> None:
         router_module().serve(paths()["home"])
         return
     parser = argparse.ArgumentParser(description="BCU: shared models for Codex Desktop.",
-                                     epilog="Everyday: menu | login | on | off | models | doctor | docs | snake | pong | doom.")
+                                     epilog="Everyday: menu | login | on | off | models | reasoning | agents | doctor | docs.")
     parser.add_argument("--no-color", action="store_true", help="Plain text output (also respects NO_COLOR)")
     parser.add_argument("--no-animate", action="store_true", help="Disable motion (also respects BOBOCODEXULTRA_NO_ANIM)")
     sub = parser.add_subparsers(dest="command")
@@ -1620,10 +1825,20 @@ def main() -> None:
     usage_parser.add_argument("--offline", action="store_true", help="Use cached pricing without contacting OpenRouter")
     sub.add_parser("reset", help="Alias for off: restore the previous desktop setup")
     sub.add_parser("install", help="Install both command names in ~/.local/bin")
+    reasoning_parser = sub.add_parser("reasoning", help="Show or set per-model BCU reasoning difficulty")
+    reasoning_parser.add_argument("effort", nargs="?", choices=REASONING_LEVELS)
+    reasoning_parser.add_argument("--model", help="Exact selected BCU model ID (defaults to selected default)")
+    agent_sub = sub.add_parser("agents", help="Set up and restore Codex subagent defaults").add_subparsers(dest="action")
+    agent_sub.add_parser("status", help="Show current user-level agent settings")
+    setup_agents = agent_sub.add_parser("setup", help="Use a selected BCU model as the subagent default")
+    setup_agents.add_argument("--model", help="Exact selected model ID (defaults to selected default)")
+    setup_agents.add_argument("--reasoning", choices=REASONING_LEVELS, help="Subagent reasoning (defaults to the model setting)")
+    setup_agents.add_argument("--limit", type=int, default=2, help="Maximum concurrent subagents (1-16)")
+    agent_sub.add_parser("restore", help="Restore agent settings from before BCU setup")
     for game in ("snake", "pong", "doom"):
         sub.add_parser(game, help=f"Play {game.capitalize()} offline in the terminal")
     docs_parser = sub.add_parser("docs", help="Read built-in command documentation")
-    docs_parser.add_argument("topic", nargs="?", choices=("auth", "model", "desktop", "codex", "games"), default="all")
+    docs_parser.add_argument("topic", nargs="?", choices=("auth", "model", "agents", "desktop", "codex", "games"), default="all")
     desktop_sub = sub.add_parser("desktop", help="Control shared desktop routing (shortcuts: on / off)").add_subparsers(dest="action", required=True)
     desktop_sub.add_parser("on", help="Enable ChatGPT, Ollama and BCU models side by side")
     desktop_sub.add_parser("off", help="Restore the previous native/Ollama desktop configuration")
@@ -1654,7 +1869,8 @@ def main() -> None:
     if args.no_animate:
         UI.motion = False
     if args.command not in ("snake", "pong", "doom") and (args.command != "codex" or args.action != "launch") and not (args.command == "usage" and args.json):
-        UI.heading({"auth": "Secure access", "model": "Model selector", "desktop": "Desktop mode",
+        UI.heading({"auth": "Secure access", "model": "Model selector", "reasoning": "Reasoning control",
+                    "agents": "Codex agents", "desktop": "Desktop mode",
                     "codex": "Codex operations", "docs": "Field guide", "status": "System check",
                     "usage": "Token & cost ledger", "reset": "Native Codex reset",
                     "doctor": "Desktop health", "menu": "Menu bar", "install": "Command installer"}.get(args.command, "Codex Desktop"))
@@ -1685,6 +1901,11 @@ def main() -> None:
             mixed_off()
         elif args.command == "install":
             install()
+        elif args.command == "reasoning":
+            reasoning_command(args.effort, args.model)
+        elif args.command == "agents":
+            agents_command(args.action or "status", getattr(args, "model", None),
+                           getattr(args, "reasoning", None), getattr(args, "limit", 2))
         elif args.command in ("snake", "pong", "doom"):
             try:
                 games_module().run(args.command)
