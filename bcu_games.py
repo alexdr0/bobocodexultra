@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import curses
+from collections import deque
 import math
 import random
 import sys
@@ -59,7 +60,7 @@ def frame(screen, minimum_width, minimum_height, render, update, key_handler, fp
             return
         if key in (ord("p"), ord("P")):
             paused = not paused
-        else:
+        elif not paused:
             key_handler(key)
         height, width = screen.getmaxyx()
         screen.erase()
@@ -275,23 +276,121 @@ class Enemy:
     x: float
     y: float
     health: int = 2
+    kind: str = "E"
+    cooldown: int = 0
+
+
+@dataclass
+class Projectile:
+    x: float
+    y: float
+    dx: float
+    dy: float
+    damage: int
+
+
+LEVEL_NAMES = ("THE BREACH", "MIRROR HALL", "UNDERGROUND", "THE CROSSING",
+               "KILL ZONE", "THE LAST GATE")
+ENEMY_STATS = {"E": (2, 0.034, 8), "F": (1, 0.064, 6),
+               "R": (2, 0.023, 5), "B": (8, 0.028, 18)}
+
+
+def level_layout(index):
+    """Six deterministic variants, with connected rooms and increasingly mixed threats."""
+    rows = [list(row.replace("E", ".")) for row in MAZE]
+    if index in (1, 3, 5):
+        rows = [row[::-1] for row in rows]
+    if index in (2, 3):
+        rows = rows[::-1]
+    # Open a different shortcut each time; never close a route or strand a pickup.
+    for x, y in (((4, 2),), ((7, 2), (11, 7)), ((5, 7), (17, 4)),
+                 ((10, 2), (14, 7)), ((4, 4), (12, 8), (18, 2)),
+                 ((5, 2), (10, 7), (17, 4), (12, 8)))[index]:
+        rows[y][x] = "."
+    # Distinct cover and crossfire lanes in later stages. Keep the outside border sealed.
+    barriers = {
+        1: ((8, 5, 13, 5), (15, 9, 18, 9)),
+        2: ((12, 1, 12, 3), (2, 6, 7, 6)),
+        3: ((8, 1, 8, 3), (16, 6, 20, 6), (4, 8, 8, 8)),
+        4: ((8, 5, 13, 5), (15, 8, 20, 8), (7, 10, 10, 10)),
+        5: ((12, 1, 17, 1), (6, 10, 11, 10), (14, 3, 14, 6)),
+    }
+    for x1, y1, x2, y2 in barriers.get(index, ()):
+        for y in range(y1, y2 + 1):
+            for x in range(x1, x2 + 1):
+                rows[y][x] = "#"
+    return tuple("".join(row) for row in rows)
 
 
 class Doom:
     """Original raycast maze shooter; no copyrighted assets or game data."""
-    def __init__(self, maze=MAZE):
+    def __init__(self, maze=None):
+        self.custom_maze = maze is not None
+        maze = maze if maze is not None else MAZE
         if not maze or any(len(row) != len(maze[0]) for row in maze):
             raise ValueError("The maze must be rectangular.")
-        self.maze = tuple(maze)
+        self.initial_maze = tuple(maze)
+        self.level_count = 1 if self.custom_maze else len(LEVEL_NAMES)
         self.reset()
 
     def reset(self):
-        self.x, self.y, self.angle = 2.5, 1.5, 0.0
-        self.health, self.ammo, self.kills, self.ticks = 100, 24, 0, 0
+        self.health, self.ammo, self.score = 100, 24, 0
+        self.level_index = 0
+        self.won = False
+        self.load_level(0)
+
+    def load_level(self, index):
+        self.level_index = index
+        self.maze = self.initial_maze if self.custom_maze or index == 0 else level_layout(index)
+        self.x = (len(self.maze[0]) - 2.5) if index in (1, 3, 5) else 2.5
+        self.y = (len(self.maze) - 2.5) if index in (2, 3) else 1.5
+        self.angle = math.pi if index in (1, 3, 5) else 0.0
+        if self.custom_maze:
+            self.x, self.y, self.angle = 2.5, 1.5, 0.0
+        self.health = min(100, self.health + (18 if index else 0))
+        self.ammo = min(48, self.ammo + (12 if index else 0))
+        self.kills = self.ticks = self.flash = self.fire_cooldown = self.hurt_cooldown = 0
+        self.projectiles = []
+        self.message = "Eliminate hostiles, then reach the gate."
+        self.message_ticks = 85
         self.enemies = [Enemy(x + 0.5, y + 0.5) for y, row in enumerate(self.maze)
                         for x, cell in enumerate(row) if cell == "E"]
+        self.pickups = {}
+        if self.custom_maze:
+            self.exit = None
+        else:
+            distances = self.distances((int(self.x), int(self.y)))
+            cells = [pos for pos, distance in distances.items() if distance >= 5]
+            cells.sort(key=lambda pos: (-distances[pos], pos[1], pos[0]))
+            self.exit = cells[0]
+            if index:
+                # Spread enemies around the arena instead of spawning a pack at the gate.
+                chosen = []
+                kinds = ("E", "F", "R", "E", "F", "R", "E", "B")
+                for kind in kinds[:index + 3]:
+                    eligible = [pos for pos in cells if pos != self.exit and pos not in chosen]
+                    pos = max(eligible, key=lambda tile: (min((abs(tile[0] - x) + abs(tile[1] - y)
+                                                              for x, y in chosen), default=distances[tile]),
+                                                          distances[tile], -tile[1], -tile[0]))
+                    chosen.append(pos)
+                    self.enemies.append(Enemy(pos[0] + 0.5, pos[1] + 0.5,
+                                              ENEMY_STATS[kind][0], kind))
+            occupied = {(int(e.x), int(e.y)) for e in self.enemies}
+            free = [pos for pos in cells if pos not in occupied and pos != self.exit]
+            for pos, kind in zip((free[len(free) // 3], free[2 * len(free) // 3]), ("A", "H")):
+                self.pickups[pos] = kind
         self.total = len(self.enemies)
-        self.flash = 0
+
+    def distances(self, start):
+        distances = {start: 0}
+        pending = deque((start,))
+        while pending:
+            x, y = pending.popleft()
+            for pos in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+                if pos not in distances and not self.wall(*pos):
+                    distances[pos] = distances[(x, y)] + 1
+                    pending.append(pos)
+        return distances
 
     def wall(self, x, y):
         ix, iy = int(x), int(y)
@@ -299,6 +398,8 @@ class Doom:
                 or self.maze[iy][ix] == "#")
 
     def move(self, forward, sideways):
+        if self.health <= 0 or self.won:
+            return
         dx = math.cos(self.angle) * forward - math.sin(self.angle) * sideways
         dy = math.sin(self.angle) * forward + math.cos(self.angle) * sideways
         next_x, next_y = self.x + dx, self.y + dy
@@ -306,6 +407,23 @@ class Doom:
             self.x = next_x
         if not self.wall(self.x, next_y + math.copysign(0.18, dy or 1)):
             self.y = next_y
+        position = (int(self.x), int(self.y))
+        item = self.pickups.pop(position, None)
+        if item == "A":
+            self.ammo = min(48, self.ammo + 12)
+            self.announce("AMMO +12")
+        elif item == "H":
+            self.health = min(100, self.health + 30)
+            self.announce("MEDKIT +30")
+        if self.exit == position and self.kills == self.total:
+            if self.level_index + 1 == self.level_count:
+                self.won = True
+                self.announce("YOU SURVIVED THE LAST GATE!")
+            else:
+                self.load_level(self.level_index + 1)
+
+    def announce(self, message):
+        self.message, self.message_ticks = message, 55
 
     def ray(self, angle, maximum=24):
         """Cast to the nearest wall, returning distance and which axis it hit."""
@@ -326,15 +444,21 @@ class Doom:
         return maximum, 0
 
     def visible(self, enemy):
-        distance = math.hypot(enemy.x - self.x, enemy.y - self.y)
-        angle = math.atan2(enemy.y - self.y, enemy.x - self.x)
-        return self.ray(angle, distance + 0.1)[0] >= distance - 0.15
+        return self.line_clear(self.x, self.y, enemy.x, enemy.y)
+
+    def line_clear(self, x1, y1, x2, y2):
+        distance = math.hypot(x2 - x1, y2 - y1)
+        for step in range(1, max(1, int(distance / 0.08))):
+            fraction = step * 0.08 / distance
+            if self.wall(x1 + (x2 - x1) * fraction, y1 + (y2 - y1) * fraction):
+                return False
+        return True
 
     def shoot(self):
-        if self.ammo <= 0 or self.health <= 0 or self.kills == self.total:
+        if self.ammo <= 0 or self.health <= 0 or self.won or self.fire_cooldown:
             return False
         self.ammo -= 1
-        self.flash = 3
+        self.flash, self.fire_cooldown = 3, 3
         candidates = []
         for enemy in self.enemies:
             if enemy.health <= 0:
@@ -349,28 +473,85 @@ class Doom:
             victim.health -= 1
             if victim.health == 0:
                 self.kills += 1
+                self.score += {"E": 100, "F": 150, "R": 200, "B": 1000}[victim.kind]
+                if self.kills % 3 == 0 and self.kills != self.total:
+                    self.pickups[(int(victim.x), int(victim.y))] = "A"
+                if self.kills == self.total:
+                    if self.exit is None:
+                        self.won = True
+                        self.announce("ARENA CLEAR!")
+                    else:
+                        self.announce("AREA CLEAR — REACH THE GATE >")
             return True
         return False
 
     def step(self):
-        if self.health <= 0 or self.kills == self.total:
+        if self.health <= 0 or self.won:
             return
         self.ticks += 1
         self.flash = max(0, self.flash - 1)
+        self.fire_cooldown = max(0, self.fire_cooldown - 1)
+        self.hurt_cooldown = max(0, self.hurt_cooldown - 1)
+        self.message_ticks = max(0, self.message_ticks - 1)
+        for shot in self.projectiles[:]:
+            shot.x += shot.dx
+            shot.y += shot.dy
+            if self.wall(shot.x, shot.y):
+                self.projectiles.remove(shot)
+            elif math.hypot(self.x - shot.x, self.y - shot.y) < 0.38:
+                self.projectiles.remove(shot)
+                self.hurt(shot.damage)
+        path = self.distances((int(self.x), int(self.y))) if self.ticks % 5 == 0 else None
         for enemy in self.enemies:
             if enemy.health <= 0:
                 continue
             distance = math.hypot(enemy.x - self.x, enemy.y - self.y)
-            if distance < 7 and self.visible(enemy):
-                if distance > 1.1:
-                    dx = (self.x - enemy.x) / distance * 0.025
-                    dy = (self.y - enemy.y) / distance * 0.025
-                    if not self.wall(enemy.x + dx, enemy.y):
-                        enemy.x += dx
-                    if not self.wall(enemy.x, enemy.y + dy):
-                        enemy.y += dy
-                elif self.ticks % 18 == 0:
-                    self.health = max(0, self.health - 8)
+            enemy.cooldown = max(0, enemy.cooldown - 1)
+            if distance > 12:
+                continue
+            if distance < 1.05:
+                if not enemy.cooldown:
+                    self.hurt(ENEMY_STATS[enemy.kind][2])
+                    enemy.cooldown = 17 if enemy.kind == "F" else 22
+                continue
+            if enemy.kind == "R" and distance < 9 and self.visible(enemy) and not enemy.cooldown:
+                self.projectiles.append(Projectile(enemy.x, enemy.y,
+                                                   (self.x - enemy.x) / distance * 0.24,
+                                                   (self.y - enemy.y) / distance * 0.24, 9))
+                enemy.cooldown = 32
+            if enemy.kind == "R" and distance < 3:
+                continue
+            speed = ENEMY_STATS[enemy.kind][1]
+            if self.visible(enemy):
+                dx, dy = (self.x - enemy.x) / distance, (self.y - enemy.y) / distance
+            else:
+                if path is None:
+                    continue
+                tile = (int(enemy.x), int(enemy.y))
+                neighbors = ((tile[0] + 1, tile[1]), (tile[0] - 1, tile[1]),
+                             (tile[0], tile[1] + 1), (tile[0], tile[1] - 1))
+                options = [pos for pos in neighbors if path.get(pos, float("inf")) < path.get(tile, float("inf"))]
+                if not options:
+                    continue
+                target = min(options, key=path.__getitem__)
+                dx, dy = target[0] + 0.5 - enemy.x, target[1] + 0.5 - enemy.y
+                length = math.hypot(dx, dy)
+                dx, dy = dx / length, dy / length
+            if not self.wall(enemy.x + dx * speed + math.copysign(0.18, dx), enemy.y):
+                enemy.x += dx * speed
+            if not self.wall(enemy.x, enemy.y + dy * speed + math.copysign(0.18, dy)):
+                enemy.y += dy * speed
+        if self.ammo == 0 and not any(kind == "A" for kind in self.pickups.values()) and self.ticks % 100 == 0:
+            self.ammo = 6
+            self.announce("EMERGENCY AMMO +6")
+
+    def hurt(self, damage):
+        if self.hurt_cooldown or self.health <= 0:
+            return
+        self.health = max(0, self.health - damage)
+        self.hurt_cooldown = 8
+        if not self.health:
+            self.announce("YOU DIED — R TO RESTART")
 
 
 def play_doom(screen):
@@ -379,7 +560,7 @@ def play_doom(screen):
 
     def keys(key):
         nonlocal show_map
-        if game.health <= 0 or game.kills == game.total:
+        if game.health <= 0 or game.won:
             if key in (ord("r"), ord("R")):
                 game.reset()
             return
@@ -422,28 +603,39 @@ def play_doom(screen):
                 shade = "▓" if shade == "█" else "▒" if shade == "▓" else shade
             for row in range(top, min(height, top + size)):
                 image[row][column] = shade
-        for enemy in sorted((e for e in game.enemies if e.health > 0),
-                            key=lambda e: math.hypot(e.x - game.x, e.y - game.y), reverse=True):
-            distance = math.hypot(enemy.x - game.x, enemy.y - game.y)
-            bearing = math.atan2(enemy.y - game.y, enemy.x - game.x) - game.angle
+        sprites = [(e.x, e.y, "W" if e.kind == "B" else e.kind) for e in game.enemies if e.health > 0]
+        sprites.extend((x + 0.5, y + 0.5, "+" if kind == "H" else "=")
+                       for (x, y), kind in game.pickups.items())
+        sprites.extend((shot.x, shot.y, "*") for shot in game.projectiles)
+        if game.exit and game.kills == game.total:
+            sprites.append((game.exit[0] + 0.5, game.exit[1] + 0.5, ">"))
+        for sprite_x, sprite_y, glyph in sorted(sprites,
+                                                key=lambda item: math.hypot(item[0] - game.x, item[1] - game.y),
+                                                reverse=True):
+            distance = math.hypot(sprite_x - game.x, sprite_y - game.y)
+            bearing = math.atan2(sprite_y - game.y, sprite_x - game.x) - game.angle
             bearing = math.atan2(math.sin(bearing), math.cos(bearing))
-            if distance < 0.3 or abs(bearing) > 0.67 or not game.visible(enemy):
+            if distance < 0.3 or abs(bearing) > 0.67 or not game.line_clear(game.x, game.y, sprite_x, sprite_y):
                 continue
             center = int((math.tan(bearing) / 0.66 + 1) * width / 2)
-            size = min(height, max(1, int(height / distance * 0.8)))
+            size = min(height, max(1, int(height / distance * (0.8 if glyph in "EFRW" else 0.35))))
             for column in range(max(0, center - max(1, size // 5)), min(width, center + max(1, size // 5) + 1)):
                 if distance >= depths[column] + 0.1:
                     continue
                 for row in range(max(0, sky - size // 2), min(height, sky + size // 2 + 1)):
-                    image[row][column] = "M"
+                    image[row][column] = glyph
         image[sky][width // 2] = "✛" if game.flash == 0 else "✦"
         for row in range(height):
-            safe_write(screen, row + 3, left, "".join(image[row]), color(5) if game.flash and row == sky else color(1))
+            safe_write(screen, row + 3, left, "".join(image[row]), color(5) if game.hurt_cooldown or (game.flash and row == sky) else color(1))
+        stage = f"{game.level_index + 1}/{game.level_count} {LEVEL_NAMES[game.level_index]}" if not game.custom_maze else "CUSTOM ARENA"
+        safe_write(screen, 2, left, f"STAGE {stage}  ·  SCORE {game.score}", color(4))
         safe_write(screen, height + 4, left,
-                   f"HEALTH {game.health:3}    AMMO {game.ammo:2}    ENEMIES {game.total - game.kills:2}"
-                   + ("   CLEARED! R restart" if game.kills == game.total else "   GAME OVER · R restart" if game.health <= 0 else ""),
+                   f"HP {game.health:3} [{'█' * (game.health // 10):10}]  AMMO {game.ammo:2}  FOES {game.total - game.kills:2}"
+                   + ("  VICTORY · R restart" if game.won else "  GAME OVER · R restart" if game.health <= 0
+                      else "  FIND GATE >" if game.kills == game.total else ""),
                    color(3) if game.health > 30 else color(5))
-        safe_write(screen, height + 5, left, "W/S move · A/D strafe · ←/→ turn · SPACE fire · M map · P pause · Q quit", color(4))
+        safe_write(screen, height + 5, left, game.message if game.message_ticks or game.won else
+                   "W/S move · A/D strafe · ←/→ turn · SPACE fire · M map · P pause · R restart · Q quit", color(4))
         if show_map and columns >= 72 and rows >= 25:
             for y, line in enumerate(game.maze):
                 if y + 3 >= rows - 1:
@@ -451,12 +643,17 @@ def play_doom(screen):
                 cells = list(line.replace("E", "."))
                 for enemy in game.enemies:
                     if enemy.health > 0 and int(enemy.y) == y:
-                        cells[int(enemy.x)] = "M"
+                        cells[int(enemy.x)] = enemy.kind
+                for (x, py), kind in game.pickups.items():
+                    if py == y:
+                        cells[x] = "+" if kind == "H" else "="
+                if game.exit and game.exit[1] == y:
+                    cells[game.exit[0]] = ">"
                 if int(game.y) == y:
                     cells[int(game.x)] = "@"
                 safe_write(screen, y + 3, left + 2, "".join(cells), color(2))
 
-    frame(screen, 70, 22, render, game.step, keys, 15)
+    frame(screen, 70, 22, render, game.step, keys, 20)
 
 
 def run(name):

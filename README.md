@@ -107,7 +107,7 @@ bobocodexultra sync     # Refresh the combined catalog
 bobocodexultra docs     # Full built-in command guide
 bobocodexultra snake    # Offline terminal Snake
 bobocodexultra pong     # Offline terminal Pong against the CPU
-bobocodexultra doom     # Original terminal maze shooter
+bobocodexultra doom     # Six-stage terminal maze shooter
 ```
 
 Quit and reopen Codex after enabling/disabling shared mode or changing selected models. Codex loads its catalog at startup; existing tasks may keep earlier provider settings. BCU preserves the native default when enabling shared mode. Pick any native, Ollama or `(BCU)` model in the desktop selector.
@@ -126,9 +126,9 @@ Run `bobocodexultra snake`, `bobocodexultra pong`, or `bobocodexultra doom` from
 | --- | --- | --- |
 | Snake | Arrow keys or WASD | Eat food; avoid walls and your tail. |
 | Pong | Up/Down or W/S | Beat the CPU to seven points. |
-| Doom | W/S forward/back; A/D strafe; Left/Right turn; Space shoot; M toggle map | Clear the maze of enemies while preserving health and ammo. |
+| Doom | W/S forward/back; A/D strafe; Left/Right turn; Space shoot; M toggle map | Survive six stages, clear each arena, then find the gate (`>`). |
 
-`doom` is a small original retro-style raycasting game, not id Software's Doom; it includes no Doom assets. See `bobocodexultra docs games` for the built-in controls. The arcade is separate from Codex Desktop's model selector and does not change provider settings.
+`doom` is an original retro-style raycasting game, not id Software's Doom; it includes no Doom assets. Its six stages add faster flankers (`F`), ranged shooters (`R`) with visible projectiles, and a tough final boss (`B` on the map, `W` in first-person view). Ordinary enemies are `E`; medkits (`+`) restore health and ammo packs (`=`) refill your weapon. Defeat every enemy before entering the gate (`>`). Health, ammo and score carry between stages, with a small resupply on each transition. Shooting has a short cooldown, and enemies can pursue you around corners. If you run completely out of ammunition with no packs left, emergency ammo arrives after a short delay to prevent an unwinnable run. Press `R` to start over. See `bobocodexultra docs games` for the built-in controls. The arcade is separate from Codex Desktop's model selector and does not change provider settings.
 
 Optional shortcuts and existing command groups still work:
 

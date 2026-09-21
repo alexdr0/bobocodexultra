@@ -88,6 +88,9 @@ class DoomTests(unittest.TestCase):
         game = games.Doom()
         self.assertTrue(math.isclose(game.ray(0)[0], 20.5))
         self.assertTrue(game.shoot())
+        self.assertFalse(game.shoot())  # weapon has a short firing cooldown
+        for _ in range(3):
+            game.step()
         self.assertTrue(game.shoot())
         self.assertEqual((game.kills, game.ammo), (1, 22))
         game.ammo = 0
@@ -101,6 +104,85 @@ class DoomTests(unittest.TestCase):
         self.assertEqual(game.x, 1.25)
         game.x, game.y, game.angle = 2.5, 3.5, -math.pi / 2
         self.assertFalse(game.visible(game.enemies[0]))
+
+    def test_six_levels_have_reachable_exits_pickups_and_threats(self):
+        game = games.Doom()
+        self.assertEqual(game.level_count, 6)
+        for index in range(game.level_count):
+            game.load_level(index)
+            self.assertEqual(len({len(row) for row in game.maze}), 1)
+            reachable = game.distances((int(game.x), int(game.y)))
+            self.assertEqual(len(reachable), sum(cell != "#" for row in game.maze for cell in row))
+            self.assertIn(game.exit, reachable)
+            self.assertTrue(all((int(enemy.x), int(enemy.y)) in reachable for enemy in game.enemies))
+            self.assertTrue(all(tile in reachable for tile in game.pickups))
+            self.assertEqual(game.total, 3 + index)
+        self.assertEqual(game.enemies[-1].kind, "B")
+
+    def test_gate_requires_clear_and_advances_preserving_score(self):
+        game = games.Doom()
+        game.x, game.y = game.exit[0] - 0.4, game.exit[1] + 0.5
+        game.move(0.6, 0)
+        self.assertEqual(game.level_index, 0)
+        game.kills = game.total
+        game.score = 300
+        game.health = 40
+        game.ammo = 8
+        game.move(-0.6, 0)
+        game.move(0.6, 0)
+        self.assertEqual(game.level_index, 1)
+        self.assertEqual((game.score, game.health, game.ammo), (300, 58, 20))
+        game.load_level(5)
+        game.kills = game.total
+        game.x, game.y = game.exit[0] + 1.4, game.exit[1] + 0.5
+        game.angle = math.pi
+        game.move(0.6, 0)
+        self.assertTrue(game.won)
+        game.reset()
+        self.assertEqual((game.level_index, game.score, game.health), (0, 0, 100))
+
+    def test_medkit_ammo_and_projectile_damage(self):
+        game = games.Doom()
+        game.health, game.ammo = 55, 3
+        game.pickups[(3, 1)] = "H"
+        game.x, game.y = 2.6, 1.5
+        game.move(0.5, 0)
+        self.assertEqual(game.health, 85)
+        game.pickups[(4, 1)] = "A"
+        game.move(1.0, 0)
+        self.assertEqual(game.ammo, 15)
+        game.projectiles.append(games.Projectile(game.x + 0.5, game.y, -0.25, 0, 9))
+        game.step()
+        self.assertEqual(game.health, 76)
+        game.projectiles.append(games.Projectile(game.x + 0.5, game.y, -0.25, 0, 9))
+        game.step()
+        self.assertEqual(game.health, 76)  # brief protection after a hit
+
+    def test_emergency_ammo_prevents_softlock(self):
+        game = games.Doom()
+        game.ammo = 0
+        game.pickups.clear()
+        game.ticks = 99
+        game.step()
+        self.assertEqual(game.ammo, 6)
+
+    def test_ranged_enemy_fires_and_boss_requires_sustained_fire(self):
+        game = games.Doom()
+        shooter = games.Enemy(5.5, 1.5, 2, "R")
+        game.enemies = [shooter]
+        game.total = 1
+        game.step()
+        self.assertEqual(len(game.projectiles), 1)
+        self.assertEqual(game.projectiles[0].damage, 9)
+        boss = games.Enemy(5.5, 1.5, 8, "B")
+        game.enemies = [boss]
+        game.projectiles.clear()
+        game.ticks = 0
+        for _ in range(8):
+            self.assertTrue(game.shoot())
+            for _ in range(3):
+                game.step()
+        self.assertEqual((boss.health, game.kills, game.score), (0, 1, 1000))
 
 
 class CLITests(unittest.TestCase):

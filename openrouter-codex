@@ -1752,7 +1752,7 @@ def docs(topic: str) -> None:
         "games": [
             ("snake", "Eat food, grow, and avoid walls and your tail. Arrows/WASD steer; R restarts."),
             ("pong", "Play first-to-seven against the CPU. Up/Down or W/S move; R rematches."),
-            ("doom", "Play BCU's original raycast maze shooter (no Doom assets). W/S move, A/D strafe, arrows turn, Space fires, M maps, R restarts."),
+            ("doom", "Six-stage original raycast shooter (no Doom assets). W/S move, A/D strafe, arrows turn, Space fires, M maps, R restarts. Clear each room and reach >; + heals, = reloads. F flanks, R shoots, B is the boss."),
             ("all games", "P pauses; Q or Esc quits. Offline, interactive UTF-8 terminal; no API key or model calls."),
         ],
     }
