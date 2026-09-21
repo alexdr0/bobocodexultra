@@ -133,6 +133,7 @@ class OpenRouterCodexTests(unittest.TestCase):
     def test_named_and_legacy_commands_and_docs_work_without_a_key(self):
         for command, expected in ((["docs", "model"], "model add [author/model-id]"),
                                   (["docs", "agents"], "agents setup"),
+                                  (["docs", "setup"], "setup --check"),
                                   (["reasoning"], "anthropic/claude-opus-5"),
                                   (["agents", "status"], "Codex default"),
                                   (["model", "list"], "anthropic/claude-opus-5"),
@@ -141,6 +142,71 @@ class OpenRouterCodexTests(unittest.TestCase):
                                     text=True, capture_output=True, check=True)
             self.assertIn(expected, result.stdout)
             self.assertNotIn("\033[", result.stdout)
+
+    def test_setup_preflight_is_read_only_and_noninteractive_cli_rejects_wizard(self):
+        with patch.dict(tool["setup_checks"].__globals__, {"ensure_macos": lambda: None}):
+            with patch.object(tool["shutil"], "which", return_value="/usr/local/bin/codex"):
+                self.assertEqual(tool["setup_checks"](), [])
+        self.assertEqual(list(self.home.iterdir()), [])
+        result = subprocess.run([sys.executable, str(TOOL), "setup"],
+                                text=True, capture_output=True, check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("interactive terminal", result.stderr)
+        self.assertEqual(list(self.home.iterdir()), [])
+
+    def test_setup_wizard_reuses_key_and_only_runs_approved_steps(self):
+        actions = []
+        globals_ = tool["setup_wizard"].__globals__
+        overrides = {
+            "setup_checks": lambda: [],
+            "install": lambda: actions.append("install"),
+            "prepare": lambda: actions.append("prepare"),
+            "model_manager": lambda chosen: actions.append("models"),
+            "key_exists": lambda: True,
+            "save_key": lambda: actions.append("key"),
+            "mixed_on": lambda: actions.append("desktop"),
+            "agents_command": lambda action: actions.append("agents:" + action),
+            "setup_confirm": lambda prompt, default=True: {
+                "Browse": True, "Replace": False, "Enable": True, "Set": True,
+            }[prompt.split()[0]],
+        }
+        with patch.dict(globals_, overrides):
+            with patch.dict(os.environ, {"TERM": "xterm-256color"}), \
+                 patch.object(sys.stdin, "isatty", return_value=True), \
+                 patch.object(sys.stdout, "isatty", return_value=True), \
+                 patch.object(sys.stderr, "isatty", return_value=True):
+                tool["setup_wizard"]()
+        self.assertEqual(actions, ["install", "prepare", "models", "desktop", "agents:setup"])
+        self.assertEqual(list(self.home.iterdir()), [])
+
+    def test_setup_check_aborts_before_writing_and_does_not_prompt(self):
+        with patch.dict(tool["setup_wizard"].__globals__, {
+            "setup_checks": lambda: ["Codex CLI missing"],
+            "install": lambda: self.fail("must not install after failed preflight"),
+        }):
+            with self.assertRaisesRegex(tool["SetupError"], "Codex CLI missing"):
+                tool["setup_wizard"](True)
+        self.assertEqual(list(self.home.iterdir()), [])
+
+    def test_setup_declining_key_never_activates_desktop(self):
+        actions = []
+        with patch.dict(tool["setup_wizard"].__globals__, {
+            "setup_checks": lambda: [],
+            "install": lambda: actions.append("install"),
+            "prepare": lambda: actions.append("prepare"),
+            "key_exists": lambda: False,
+            "save_key": lambda: self.fail("key entry was declined"),
+            "mixed_on": lambda: self.fail("must not activate without a key"),
+            "setup_confirm": lambda prompt, default=True: False,
+        }):
+            with patch.dict(os.environ, {"TERM": "dumb"}), \
+                 patch.object(sys.stdin, "isatty", return_value=True), \
+                 patch.object(sys.stdout, "isatty", return_value=True), \
+                 patch.object(sys.stderr, "isatty", return_value=True):
+                with self.assertRaisesRegex(tool["SetupError"], "before desktop activation"):
+                    tool["setup_wizard"]()
+        self.assertEqual(actions, ["install", "prepare"])
+        self.assertEqual(list(self.home.iterdir()), [])
 
     def test_reasoning_per_model_updates_selector_and_cli_profile(self):
         chosen = tool["selection"]()

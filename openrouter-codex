@@ -226,7 +226,8 @@ def desktop_home() -> None:
     UI.row("ROUTER", "Running locally" if runtime.get("home") == str(paths()["home"]) else "Stopped")
     UI.row("MENU", "bobocodexultra menu  ·  install/open the macOS menu bar app")
     UI.section("Everyday commands")
-    for command, purpose in (("login", "Save your OpenRouter key securely"),
+    for command, purpose in (("setup", "Guided first-time setup (or setup --check)"),
+                             ("login", "Save your OpenRouter key securely"),
                              ("on", "Use ChatGPT, Ollama and BCU models side by side"),
                              ("models", "Search and choose BCU models"),
                              ("reasoning", "Set per-model BCU reasoning difficulty"),
@@ -236,6 +237,106 @@ def desktop_home() -> None:
                              ("docs", "Read the full command guide")):
         UI.row(command, purpose)
     UI.row("RELOAD", "Quit and reopen Codex after changing modes or model selections.", "amber")
+
+
+def setup_checks() -> list[str]:
+    """Read-only preflight; never fetch a credential or modify desktop settings."""
+    failures = []
+    UI.section("Setup preflight")
+    try:
+        ensure_macos()
+        UI.row("PLATFORM", "macOS Keychain available", "mint")
+    except SetupError as exc:
+        UI.row("PLATFORM", str(exc), "amber")
+        failures.append(str(exc))
+    if sys.version_info >= (3, 14):
+        UI.row("PYTHON", f"{sys.version_info.major}.{sys.version_info.minor} ready", "mint")
+    else:
+        UI.row("PYTHON", "3.14+ required for shared desktop routing", "amber")
+        failures.append("Python 3.14+ is required; run this wizard with that Python installation.")
+    codex = shutil.which("codex")
+    UI.row("CODEX CLI", codex or "not found on PATH", "mint" if codex else "amber")
+    if not codex:
+        failures.append("Install Codex CLI and make `codex` available on PATH before setup.")
+    p = paths()
+    try:
+        if p["config"].is_symlink():
+            raise SetupError("Codex config is a symlink; BCU will not replace it.")
+        if p["config"].exists():
+            tomllib.loads(p["config"].read_text())
+        selection()
+        UI.row("CONFIG", "existing settings readable; unrelated values preserved", "mint")
+    except (SetupError, OSError, ValueError, UnicodeError) as exc:
+        UI.row("CONFIG", str(exc), "amber")
+        failures.append(f"Fix the Codex configuration before setup: {exc}")
+    if not failures:
+        UI.done("Preflight passed. No files or credentials were changed.")
+    return failures
+
+
+def setup_confirm(prompt: str, default: bool = True) -> bool:
+    suffix = "Y/n" if default else "y/N"
+    while True:
+        try:
+            response = input(UI.paint(f"  {prompt} [{suffix}] ", "cyan")).strip().casefold()
+        except (EOFError, KeyboardInterrupt) as exc:
+            print()
+            raise SetupError("Setup canceled; completed steps remain available to resume safely.") from exc
+        if not response:
+            return default
+        if response in ("y", "yes"):
+            return True
+        if response in ("n", "no"):
+            return False
+        UI.row("CHOICE", "Enter yes or no.", "amber")
+
+
+def setup_wizard(check_only: bool = False) -> None:
+    """Guided, resumable setup using the same guarded operations as the normal CLI."""
+    if not check_only and not (sys.stdin.isatty() and sys.stdout.isatty() and sys.stderr.isatty()):
+        raise SetupError("Setup needs an interactive terminal. Run `bobocodexultra setup --check` "
+                         "for a read-only check, or open Terminal for the guided wizard.")
+    failures = setup_checks()
+    if failures:
+        raise SetupError("Preflight failed: " + "; ".join(failures))
+    if check_only:
+        return
+    UI.section("1 / Install command")
+    install()
+    UI.section("2 / Select models")
+    prepare()
+    if os.environ.get("TERM") == "dumb":
+        UI.row("PICKER", "This terminal cannot open the full-screen picker; keeping the current lineup.", "amber")
+        UI.row("LATER", "Run `bobocodexultra models` in a UTF-8 xterm-compatible terminal.")
+    elif setup_confirm("Browse and select OpenRouter models now?"):
+        try:
+            model_manager(selection())
+        except SetupError as exc:
+            UI.row("PICKER", f"Unavailable: {exc}", "amber")
+            if not setup_confirm("Continue with the currently selected models?"):
+                raise SetupError("Setup stopped before desktop activation; retry with `bobocodexultra setup`.") from exc
+    UI.section("3 / Secure authentication")
+    if key_exists():
+        if setup_confirm("Replace the OpenRouter key already in Keychain?", False):
+            save_key()
+        else:
+            UI.done("Reusing the saved Keychain item; its value was not read.")
+    else:
+        if not setup_confirm("Save an OpenRouter key using the hidden macOS Keychain prompt?"):
+            raise SetupError("Setup stopped before desktop activation. Run `bobocodexultra setup` when ready.")
+        save_key()
+    UI.section("4 / Codex Desktop")
+    if setup_confirm("Enable BCU models beside native ChatGPT and Ollama models?"):
+        mixed_on()
+        if setup_confirm("Set the selected BCU model as the Codex subagent default?", False):
+            agents_command("setup")
+    else:
+        UI.row("DESKTOP", "Not changed; use `bobocodexultra on` later.", "amber")
+    UI.section("Setup complete")
+    UI.row("MODELS", f"{len(selection()['models'])} selected; manage anytime with `bobocodexultra models`.")
+    UI.row("NEXT", "Quit and reopen Codex Desktop, then run `bobocodexultra doctor`.")
+    UI.row("UNDO", "`bobocodexultra off` restores your previous desktop routing.")
+    UI.row("COST", "No billed model call was made during setup.", "mint")
 
 
 def safe_text(value: object, limit: int = 100) -> str:
@@ -1751,6 +1852,11 @@ def docs(topic: str) -> None:
             ("menu", "Open or install the BCU macOS menu bar companion."),
             ("menu install", "Build a signed local app, open it, and launch it automatically at login."),
         ],
+        "setup": [
+            ("setup --check", "Read-only macOS, Python, Codex CLI and config preflight; safe in scripts."),
+            ("setup", "Interactive terminal wizard: install CLI, choose models, secure Keychain prompt, enable desktop, optional agents."),
+            ("on / off", "Enable the shared selector or restore your previous native configuration."),
+        ],
         "codex": [
             ("codex launch", "Open Codex CLI with the OpenRouter profile."),
             ("codex smoke", "Optional billed read-only model call."),
@@ -1771,6 +1877,7 @@ def docs(topic: str) -> None:
             print("    " + UI.paint(explanation, "dim"))
     if topic == "all":
         UI.section("Essentials")
+        UI.row("setup", "Guided installation; `setup --check` verifies prerequisites without changes.")
         UI.row("login", "Securely enter your OpenRouter key and enable the shared desktop selector.")
         UI.row("on / off", "Enable shared desktop mode or return to your previous setup.")
         UI.row("models", "Search, sort and choose multiple BCU models in the graphical terminal picker.")
@@ -1783,14 +1890,14 @@ def docs(topic: str) -> None:
         UI.row("usage", "Exact locally recorded BCU tokens plus current-price cost estimates.")
         UI.row("snake / pong / doom", "Play offline terminal arcade games; `docs games` shows controls.")
         UI.row("reset", "Alias for off.")
-        UI.row("docs [topic]", "Read these built-in docs; topics: auth, model, agents, desktop, codex, games.")
+        UI.row("docs [topic]", "Read these built-in docs; topics: setup, auth, model, agents, desktop, codex, games.")
         UI.row("install", "Update both names in ~/.local/bin from this executable.")
         UI.row("ALIAS", "boboultracodex works identically to bobocodexultra.", "pink")
     UI.section("Safety")
     UI.row("CREDENTIALS", "Only the macOS Keychain stores the API key.", "mint")
     UI.row("CHARGES", "Browsing metadata is read-only; model calls and smoke tests may incur charges.", "amber")
     UI.row("RESTART", "Relaunch Codex after changing desktop mode or selected models.")
-    UI.row("REFERENCE", "https://learn.chatgpt.com/docs/config-file/config-advanced", "dim")
+    UI.row("REFERENCE", "https://developers.openai.com/codex/config-reference/", "dim")
 
 
 def legacy_arguments(argv: list[str]) -> list[str]:
@@ -1799,7 +1906,7 @@ def legacy_arguments(argv: list[str]) -> list[str]:
         "login": ("auth", "login"), "on": ("desktop", "on"), "off": ("desktop", "off"),
         "add": ("model", "add"), "remove": ("model", "remove"),
         "default": ("model", "default"), "sync": ("model", "sync"),
-        "setup": ("auth", "login"), "prepare": ("auth", "prepare"),
+        "prepare": ("auth", "prepare"),
         "models": ("model",), "desktop-on": ("desktop", "on"),
         "desktop-off": ("desktop", "off"), "launch": ("codex", "launch"),
         "smoke": ("codex", "smoke"),
@@ -1812,10 +1919,12 @@ def main() -> None:
         router_module().serve(paths()["home"])
         return
     parser = argparse.ArgumentParser(description="BCU: shared models for Codex Desktop.",
-                                     epilog="Everyday: menu | login | on | off | models | reasoning | agents | doctor | docs.")
+                                     epilog="Everyday: setup | menu | login | on | off | models | reasoning | agents | doctor | docs.")
     parser.add_argument("--no-color", action="store_true", help="Plain text output (also respects NO_COLOR)")
     parser.add_argument("--no-animate", action="store_true", help="Disable motion (also respects BOBOCODEXULTRA_NO_ANIM)")
     sub = parser.add_subparsers(dest="command")
+    setup_parser = sub.add_parser("setup", help="Guided terminal installation and Codex Desktop setup")
+    setup_parser.add_argument("--check", action="store_true", help="Read-only prerequisites check; no TTY needed")
     auth_sub = sub.add_parser("auth", help="Secure Keychain login and profile preparation").add_subparsers(dest="action", required=True)
     login_parser = auth_sub.add_parser("login", help="Securely save a key and activate desktop mode")
     login_parser.add_argument("--no-desktop", action="store_true", help="Leave the desktop config unchanged")
@@ -1845,7 +1954,7 @@ def main() -> None:
     for game in ("snake", "pong", "doom"):
         sub.add_parser(game, help=f"Play {game.capitalize()} offline in the terminal")
     docs_parser = sub.add_parser("docs", help="Read built-in command documentation")
-    docs_parser.add_argument("topic", nargs="?", choices=("auth", "model", "agents", "desktop", "codex", "games"), default="all")
+    docs_parser.add_argument("topic", nargs="?", choices=("setup", "auth", "model", "agents", "desktop", "codex", "games"), default="all")
     desktop_sub = sub.add_parser("desktop", help="Control shared desktop routing (shortcuts: on / off)").add_subparsers(dest="action", required=True)
     desktop_sub.add_parser("on", help="Enable ChatGPT, Ollama and BCU models side by side")
     desktop_sub.add_parser("off", help="Restore the previous native/Ollama desktop configuration")
@@ -1876,7 +1985,7 @@ def main() -> None:
     if args.no_animate:
         UI.motion = False
     if args.command not in ("snake", "pong", "doom") and (args.command != "codex" or args.action != "launch") and not (args.command == "usage" and args.json):
-        UI.heading({"auth": "Secure access", "model": "Model selector", "reasoning": "Reasoning control",
+        UI.heading({"setup": "Guided setup", "auth": "Secure access", "model": "Model selector", "reasoning": "Reasoning control",
                     "agents": "Codex agents", "desktop": "Desktop mode",
                     "codex": "Codex operations", "docs": "Field guide", "status": "System check",
                     "usage": "Token & cost ledger", "reset": "Native Codex reset",
@@ -1884,6 +1993,8 @@ def main() -> None:
     try:
         if args.command is None:
             desktop_home()
+        elif args.command == "setup":
+            setup_wizard(args.check)
         elif args.command == "docs":
             docs(args.topic)
         elif args.command == "auth" and args.action == "login":

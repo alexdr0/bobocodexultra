@@ -4,35 +4,43 @@
 
 BCU adds OpenRouter models alongside native ChatGPT and Ollama models in the **Codex desktop app**. It runs a local routing service and keeps Codex's built-in OpenAI provider and existing ChatGPT sign-in. It does not patch the signed desktop application.
 
-## Set up BCU on your Mac
+[Download the latest GitHub release](https://github.com/alexdr0/bobocodexultra/releases/latest) or clone the repository below. Releases contain source code; the setup wizard installs the local CLI from that source, not a prebuilt app.
 
-You need macOS, the Codex desktop app, Python 3.14+ (for built-in zstd decompression), the `codex` CLI on your PATH, and an OpenRouter account with an API key. Check the prerequisites first:
+## Set up BCU on your Mac (guided terminal wizard)
 
-```sh
-python3 --version       # Must be 3.14 or newer
-command -v codex        # Must print a path
-```
-
-Clone the repository and install from its root; keep `openrouter-codex`, `bcu_router.py`, `bcu_games.py`, `bcu_doom_render.py`, and `BCUStatus.swift` together:
+You need macOS, the Codex desktop app, Python 3.14+ (for built-in zstd decompression), the `codex` CLI on your PATH, and an OpenRouter account with an API key. Clone the repository, run the read-only preflight, then start the wizard:
 
 ```sh
 git clone https://github.com/alexdr0/bobocodexultra.git
 cd bobocodexultra
-python3 openrouter-codex install
-export PATH="$HOME/.local/bin:$PATH"  # Current terminal only
-bobocodexultra --help
+python3 openrouter-codex setup --check
+python3 openrouter-codex setup
 ```
 
-`bobocodexultra` and its alias `boboultracodex` install into `~/.local/bin`. Add that directory to your shell's PATH in your shell startup configuration to use the command in future terminals. You do not need `sudo`.
+The wizard installs the global `bobocodexultra` and `boboultracodex` commands, opens the searchable multi-select model picker (if your terminal supports it), uses macOS Keychain's hidden prompt for your API key, offers to enable the shared Codex Desktop model selector, and optionally sets your Codex subagent defaults. It is resumable: run `bobocodexultra setup` again if you cancel or need to change a choice. The default model lineup works if you skip the picker or its metadata endpoint is unavailable. The preflight makes no changes, and the wizard never runs a paid inference test.
+
+Commands install into `~/.local/bin`. If that directory is not already on your PATH, add it to your shell startup configuration; for the current terminal you can run:
 
 ```sh
+export PATH="$HOME/.local/bin:$PATH"  # Current terminal only
+bobocodexultra doctor
+```
+
+Quit and reopen Codex Desktop after enabling shared mode or changing models; native ChatGPT and existing Ollama models remain available alongside entries labeled `[Model Name] (BCU)`. To undo the desktop routing, run `bobocodexultra off` and reopen Codex. The wizard does not open Codex, read your saved key, or take over unrelated config settings. No `sudo` is required.
+
+### Manual setup and later changes
+
+If you prefer individual commands, keep `openrouter-codex`, `bcu_router.py`, `bcu_games.py`, `bcu_doom_render.py`, and `BCUStatus.swift` together in the cloned directory and run:
+
+```sh
+bobocodexultra install  # Or: python3 openrouter-codex install
 bobocodexultra login    # Secure Keychain prompt; activates shared desktop mode
 bobocodexultra models   # Search and choose which BCU models appear
 bobocodexultra reasoning # View reasoning defaults for selected BCU models
 bobocodexultra doctor   # Check the local router and Codex integration
 ```
 
-Quit and reopen Codex Desktop to refresh its model selector. Your native ChatGPT and existing Ollama models remain available alongside entries labeled `[Model Name] (BCU)`. To return to the previous native setup, run `bobocodexultra off` and reopen Codex. The optional menu bar companion installs with `bobocodexultra menu install`.
+The optional menu bar companion installs with `bobocodexultra menu install`. For setup help run `bobocodexultra docs setup`. The full-screen picker needs an interactive UTF-8 terminal (`TERM=xterm-256color` or similar); the wizard keeps the existing lineup if the picker is unavailable and asks before continuing after a catalog error. See the [official Codex configuration reference](https://developers.openai.com/codex/config-reference/) for the underlying user-level settings.
 
 Credentials are entered using macOS Keychain's secure terminal prompt; never put a key into a command argument, commit, issue, or assistant message. If you only want offline Snake, Pong, and Doom, the installation is enough—no key or desktop configuration is needed.
 
