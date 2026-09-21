@@ -13,7 +13,7 @@ python3 --version       # Must be 3.14 or newer
 command -v codex        # Must print a path
 ```
 
-Clone the repository and install from its root; keep `openrouter-codex`, `bcu_router.py`, `bcu_games.py`, and `BCUStatus.swift` together:
+Clone the repository and install from its root; keep `openrouter-codex`, `bcu_router.py`, `bcu_games.py`, `bcu_doom_render.py`, and `BCUStatus.swift` together:
 
 ```sh
 git clone https://github.com/alexdr0/bobocodexultra.git
@@ -128,7 +128,7 @@ Run `bobocodexultra snake`, `bobocodexultra pong`, or `bobocodexultra doom` from
 | Pong | Up/Down or W/S | Beat the CPU to seven points. |
 | Doom | W/S forward/back; A/D strafe; Left/Right turn; Space shoot; M toggle map | Survive six stages, clear each arena, then find the gate (`>`). |
 
-`doom` is an original retro-style raycasting game, not id Software's Doom; it includes no Doom assets. Its six stages add faster flankers (`F`), ranged shooters (`R`) with visible projectiles, and a tough final boss (`B` on the map, `W` in first-person view). Ordinary enemies are `E`; medkits (`+`) restore health and ammo packs (`=`) refill your weapon. Defeat every enemy before entering the gate (`>`). Health, ammo and score carry between stages, with a small resupply on each transition. Shooting has a short cooldown, and enemies can pursue you around corners. If you run completely out of ammunition with no packs left, emergency ammo arrives after a short delay to prevent an unwinnable run. Press `R` to start over. See `bobocodexultra docs games` for the built-in controls. The arcade is separate from Codex Desktop's model selector and does not change provider settings.
+`doom` is an original retro-style raycasting game, not id Software's Doom; it includes no Doom assets. Its graphics use a two-pixel-per-cell color renderer, procedural textured walls and perspective floor, stage lighting, hand-drawn enemy and pickup sprites, a first-person weapon, and a monochrome fallback. A larger UTF-8 terminal shows more detail; no image downloads or graphics dependencies are required. Its six stages add faster flankers (`F`), ranged shooters (`R`) with visible projectiles, and a tough final boss (`B` on the map). Ordinary enemies are `E`; medkits (`+`) restore health and ammo packs (`=`) refill your weapon. Defeat every enemy before entering the gate (`>`). Health, ammo and score carry between stages, with a small resupply on each transition. Shooting has a short cooldown, and enemies can pursue you around corners. If you run completely out of ammunition with no packs left, emergency ammo arrives after a short delay to prevent an unwinnable run. Press `R` to start over. See `bobocodexultra docs games` for the built-in controls. The arcade is separate from Codex Desktop's model selector and does not change provider settings.
 
 Optional shortcuts and existing command groups still work:
 

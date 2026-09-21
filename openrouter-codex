@@ -1616,7 +1616,14 @@ def install() -> None:
         games_target = target.with_name("bcu_games.py")
         if games_target.is_symlink() or (games_target.exists() and not games_target.read_bytes().startswith(b'"""BCU terminal arcade')):
             raise SetupError("An unrelated bcu_games.py already exists beside the CLI.")
+        art_source = source.with_name("bcu_doom_render.py")
+        if not art_source.is_file():
+            raise SetupError("Missing bcu_doom_render.py; install from the complete BCU folder.")
+        art_target = target.with_name("bcu_doom_render.py")
+        if art_target.is_symlink() or (art_target.exists() and not art_target.read_bytes().startswith(b'"""Procedural, asset-free')):
+            raise SetupError("An unrelated bcu_doom_render.py already exists beside the CLI.")
         atomic_write(module_target, module.read_bytes())
+        atomic_write(art_target, art_source.read_bytes())
         atomic_write(games_target, games_source.read_bytes())
         menu_source = source.with_name("BCUStatus.swift")
         if not menu_source.is_file():

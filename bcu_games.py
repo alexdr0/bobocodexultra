@@ -10,6 +10,8 @@ import sys
 import time
 from dataclasses import dataclass
 
+from bcu_doom_render import DoomRenderer
+
 
 class GameError(Exception):
     pass
@@ -44,7 +46,7 @@ def palette():
     return curses.color_pair
 
 
-def frame(screen, minimum_width, minimum_height, render, update, key_handler, fps=15):
+def frame(screen, minimum_width, minimum_height, render, update, key_handler, fps=15, frame_interval=0.018):
     screen.nodelay(True)
     screen.keypad(True)
     try:
@@ -77,7 +79,7 @@ def frame(screen, minimum_width, minimum_height, render, update, key_handler, fp
             if paused:
                 safe_write(screen, height - 2, 2, "PAUSED · P resume · Q quit", color(4))
         screen.refresh()
-        time.sleep(0.018)
+        time.sleep(frame_interval)
 
 
 class Snake:
@@ -427,6 +429,11 @@ class Doom:
 
     def ray(self, angle, maximum=24):
         """Cast to the nearest wall, returning distance and which axis it hit."""
+        distance, side, _ = self.ray_detail(angle, maximum)
+        return distance, side
+
+    def ray_detail(self, angle, maximum=24):
+        """Return distance, wall axis, and texture coordinate for a DDA wall hit."""
         direction_x, direction_y = math.cos(angle), math.sin(angle)
         cell_x, cell_y = int(self.x), int(self.y)
         step_x, step_y = (1 if direction_x >= 0 else -1), (1 if direction_y >= 0 else -1)
@@ -440,8 +447,9 @@ class Doom:
             else:
                 distance, side_y, cell_y, side = side_y, side_y + delta_y, cell_y + step_y, 1
             if self.wall(cell_x, cell_y):
-                return distance, side
-        return maximum, 0
+                hit = (self.y + direction_y * distance) if side == 0 else (self.x + direction_x * distance)
+                return distance, side, hit % 1.0
+        return maximum, 0, 0.0
 
     def visible(self, enemy):
         return self.line_clear(self.x, self.y, enemy.x, enemy.y)
@@ -556,6 +564,7 @@ class Doom:
 
 def play_doom(screen):
     game = Doom()
+    graphics = DoomRenderer()
     show_map = False
 
     def keys(key):
@@ -587,60 +596,25 @@ def play_doom(screen):
         rows, columns = screen.getmaxyx()
         width, height = min(columns - 4, 110), min(rows - 8, 30)
         left = (columns - width) // 2
-        safe_write(screen, 1, left, "✦ B C U  /  D O O M     ORIGINAL TERMINAL MAZE SHOOTER", color(5))
-        sky = height // 2
-        image = [[" " if row < sky else "." for _ in range(width)] for row in range(height)]
-        depths = []
-        for column in range(width):
-            offset = math.atan((2 * column / width - 1) * 0.66)
-            raw_distance, side = game.ray(game.angle + offset)
-            distance = max(0.12, raw_distance * math.cos(offset))
-            depths.append(distance)
-            size = min(height, int(height / distance))
-            top = max(0, (height - size) // 2)
-            shade = "█" if distance < 3 else "▓" if distance < 6 else "▒" if distance < 11 else "░"
-            if side:
-                shade = "▓" if shade == "█" else "▒" if shade == "▓" else shade
-            for row in range(top, min(height, top + size)):
-                image[row][column] = shade
-        sprites = [(e.x, e.y, "W" if e.kind == "B" else e.kind) for e in game.enemies if e.health > 0]
-        sprites.extend((x + 0.5, y + 0.5, "+" if kind == "H" else "=")
-                       for (x, y), kind in game.pickups.items())
-        sprites.extend((shot.x, shot.y, "*") for shot in game.projectiles)
-        if game.exit and game.kills == game.total:
-            sprites.append((game.exit[0] + 0.5, game.exit[1] + 0.5, ">"))
-        for sprite_x, sprite_y, glyph in sorted(sprites,
-                                                key=lambda item: math.hypot(item[0] - game.x, item[1] - game.y),
-                                                reverse=True):
-            distance = math.hypot(sprite_x - game.x, sprite_y - game.y)
-            bearing = math.atan2(sprite_y - game.y, sprite_x - game.x) - game.angle
-            bearing = math.atan2(math.sin(bearing), math.cos(bearing))
-            if distance < 0.3 or abs(bearing) > 0.67 or not game.line_clear(game.x, game.y, sprite_x, sprite_y):
-                continue
-            center = int((math.tan(bearing) / 0.66 + 1) * width / 2)
-            size = min(height, max(1, int(height / distance * (0.8 if glyph in "EFRW" else 0.35))))
-            for column in range(max(0, center - max(1, size // 5)), min(width, center + max(1, size // 5) + 1)):
-                if distance >= depths[column] + 0.1:
-                    continue
-                for row in range(max(0, sky - size // 2), min(height, sky + size // 2 + 1)):
-                    image[row][column] = glyph
-        image[sky][width // 2] = "✛" if game.flash == 0 else "✦"
-        for row in range(height):
-            safe_write(screen, row + 3, left, "".join(image[row]), color(5) if game.hurt_cooldown or (game.flash and row == sky) else color(1))
+        safe_write(screen, 1, left, "◢ BCU / DOOM ◣     ORIGINAL SIX-STAGE TERMINAL SHOOTER", color(5))
+        graphics.draw(screen, game, left, 3, width, height)
         stage = f"{game.level_index + 1}/{game.level_count} {LEVEL_NAMES[game.level_index]}" if not game.custom_maze else "CUSTOM ARENA"
-        safe_write(screen, 2, left, f"STAGE {stage}  ·  SCORE {game.score}", color(4))
+        safe_write(screen, 2, left, f"▰▰ STAGE {stage}  /  SCORE {game.score:05}  /  {game.kills:02}/{game.total:02} ELIMINATED", color(4))
+        safe_write(screen, height + 3, left, "━" * width, color(5))
         safe_write(screen, height + 4, left,
                    f"HP {game.health:3} [{'█' * (game.health // 10):10}]  AMMO {game.ammo:2}  FOES {game.total - game.kills:2}"
                    + ("  VICTORY · R restart" if game.won else "  GAME OVER · R restart" if game.health <= 0
                       else "  FIND GATE >" if game.kills == game.total else ""),
                    color(3) if game.health > 30 else color(5))
         safe_write(screen, height + 5, left, game.message if game.message_ticks or game.won else
-                   "W/S move · A/D strafe · ←/→ turn · SPACE fire · M map · P pause · R restart · Q quit", color(4))
+                   "CLEAR THE ARENA  ·  COLLECT SUPPLIES  ·  REACH THE GATE", color(4))
+        safe_write(screen, height + 6, left,
+                   "WASD move · ←→ aim · SPACE shoot · M map · P pause · R reset · Q quit", color(1))
         if show_map and columns >= 72 and rows >= 25:
+            map_left = left + 2
+            safe_write(screen, 3, map_left, "╔" + "═" * len(game.maze[0]) + "╗", color(2))
             for y, line in enumerate(game.maze):
-                if y + 3 >= rows - 1:
-                    break
-                cells = list(line.replace("E", "."))
+                cells = ["█" if cell == "#" else "·" for cell in line]
                 for enemy in game.enemies:
                     if enemy.health > 0 and int(enemy.y) == y:
                         cells[int(enemy.x)] = enemy.kind
@@ -650,10 +624,14 @@ def play_doom(screen):
                 if game.exit and game.exit[1] == y:
                     cells[game.exit[0]] = ">"
                 if int(game.y) == y:
-                    cells[int(game.x)] = "@"
-                safe_write(screen, y + 3, left + 2, "".join(cells), color(2))
+                    direction = round(game.angle / (math.pi / 2)) % 4
+                    cells[int(game.x)] = ("▶", "▼", "◀", "▲")[direction]
+                safe_write(screen, y + 4, map_left, "║" + "".join(cells) + "║", color(2))
+            safe_write(screen, len(game.maze) + 4, map_left,
+                       "╚" + "═" * len(game.maze[0]) + "╝", color(2))
+            safe_write(screen, len(game.maze) + 5, map_left, "E/F/R/B hostiles  + HP  = ammo", color(4))
 
-    frame(screen, 70, 22, render, game.step, keys, 20)
+    frame(screen, 70, 22, render, game.step, keys, 20, 0.045)
 
 
 def run(name):

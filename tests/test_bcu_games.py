@@ -6,6 +6,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -13,6 +14,7 @@ SPEC = importlib.util.spec_from_file_location("bcu_games", ROOT / "bcu_games.py"
 games = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = games
 SPEC.loader.exec_module(games)
+import bcu_doom_render as art
 
 
 class SnakeTests(unittest.TestCase):
@@ -183,6 +185,42 @@ class DoomTests(unittest.TestCase):
             for _ in range(3):
                 game.step()
         self.assertEqual((boss.health, game.kills, game.score), (0, 1, 1000))
+
+
+class DoomGraphicsTests(unittest.TestCase):
+    def test_half_block_viewport_uses_texture_and_stage_palettes(self):
+        game = games.Doom()
+        renderer = art.DoomRenderer()
+        image = renderer.pixels(game, 80, 24)
+        self.assertEqual((len(image), len(image[0])), (48, 80))
+        self.assertGreaterEqual(len({pixel for row in image for pixel in row}), 8)
+        game.load_level(5)
+        final_stage = renderer.pixels(game, 80, 24)
+        self.assertNotEqual(image, final_stage)
+        self.assertIn(art.VIOLET, {pixel for row in final_stage for pixel in row})
+
+    def test_sprites_obey_wall_occlusion_and_weapon_flash(self):
+        game = games.Doom()
+        renderer = art.DoomRenderer()
+        baseline = renderer.pixels(game, 80, 24)
+        enemy = game.enemies.pop(0)
+        self.assertNotEqual(baseline, renderer.pixels(game, 80, 24))
+        game.enemies.insert(0, enemy)
+        game.x, game.y, game.angle = 2.5, 3.5, -math.pi / 2
+        blocked = renderer.pixels(game, 80, 24)
+        game.enemies.pop(0)
+        self.assertEqual(blocked, renderer.pixels(game, 80, 24))
+        game.flash = 3
+        self.assertNotEqual(blocked, renderer.pixels(game, 80, 24))
+
+    def test_monochrome_fallback_and_sprite_ink_are_safe(self):
+        self.assertTrue(all(set("".join(sprite)) <= set(art.INK) | {" "}
+                            for sprite in (*art.SPRITES.values(), art.WEAPON)))
+        with patch.object(art.curses, "has_colors", return_value=False):
+            terminal = art.TerminalPixels()
+        self.assertEqual(terminal.cell(art.WHITE, art.BLACK)[1], 0)
+        with self.assertRaises(ValueError):
+            art.DoomRenderer().pixels(games.Doom(), 0, 10)
 
 
 class CLITests(unittest.TestCase):
