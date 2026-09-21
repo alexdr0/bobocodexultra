@@ -8,6 +8,7 @@ import tempfile
 import tomllib
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -96,6 +97,46 @@ class OpenRouterCodexTests(unittest.TestCase):
             with self.assertRaises(tool["SetupError"]):
                 tool["update_selection"](chosen)
         self.assertTrue(catalog.read_text().endswith("\n\n"))
+
+    def test_prepare_upgrades_only_a_checksum_owned_legacy_reasoning_catalog(self):
+        globals_ = tool["prepare"].__globals__
+        with patch.dict(globals_, {"ensure_macos": lambda: None}):
+            tool["prepare"]()
+            path = self.home / "openrouter-codex-models.json"
+            old = json.loads(path.read_text())
+            for model in old["models"]:
+                model["supported_reasoning_levels"] = [{"effort": "high", "description": "High reasoning"}]
+            legacy = (json.dumps(old, indent=2) + "\n").encode()
+            path.write_bytes(legacy)
+            selected = self.home / "openrouter-codex-selection.json"
+            record = json.loads(selected.read_text())
+            record["catalog_sha256"] = tool["sha"](legacy)
+            selected.write_text(json.dumps(record))
+            tool["prepare"]()
+        upgraded = json.loads(path.read_text())["models"]
+        self.assertTrue(all([level["effort"] for level in m["supported_reasoning_levels"]]
+                            == ["low", "medium", "high"] for m in upgraded))
+        backups = list(self.home.glob("openrouter-codex-models.json.backup-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), legacy)
+
+    def test_doctor_identifies_catalog_that_locks_gui_thinking(self):
+        chosen = tool["selection"]()
+        stale = json.loads(tool["catalog_bytes"](self.home, chosen))
+        for model in stale["models"]:
+            model["supported_reasoning_levels"] = [{"effort": "high"}]
+        catalog = self.home / "bcu" / "models.json"
+        catalog.parent.mkdir()
+        catalog.write_text(json.dumps(stale))
+        controller = SimpleNamespace(state=self.home / "absent-state.json", catalog=catalog)
+        recorded = []
+        with patch.dict(tool["doctor"].__globals__, {
+            "mixed_controller": lambda: controller,
+            "router_module": lambda: SimpleNamespace(health=lambda: {}),
+            "key_exists": lambda: False,
+        }), patch.object(tool["UI"], "row", side_effect=lambda *args, **kwargs: recorded.append(args)):
+            tool["doctor"]()
+        self.assertIn("model sync", next(args[1] for args in recorded if args[0] == "GUI THINKING"))
 
     def test_label_sync_preserves_unrelated_desktop_edit(self):
         (self.home / "config.toml").write_text('model = "gpt-6-astra"\nservice_tier = "default"\n')

@@ -213,7 +213,17 @@ def doctor() -> None:
     if parsed.get("model_reasoning_effort"):
         UI.row("GLOBAL EFFORT", f"{parsed['model_reasoning_effort']} (may override BCU model defaults)", "amber")
     if control.catalog.exists():
-        UI.row("CATALOG", f"{len(json.loads(control.catalog.read_text())['models'])} combined models")
+        active_models = json.loads(control.catalog.read_text())["models"]
+        UI.row("CATALOG", f"{len(active_models)} combined models")
+        by_id = {model["slug"]: model for model in active_models}
+        missing = [model["id"] for model in chosen["models"]
+                   if not set(REASONING_LEVELS).issubset({level.get("effort") for level in
+                                                          by_id.get(model["id"], {}).get("supported_reasoning_levels", [])})]
+        if missing:
+            UI.row("GUI THINKING", f"{len(missing)} BCU models lack low/medium/high in the active catalog; "
+                   "run `bobocodexultra model sync` and fully relaunch Codex.", "amber")
+        else:
+            UI.row("GUI THINKING", "low / medium / high advertised for all selected BCU models", "mint")
     if runtime:
         UI.row("REQUESTS", json.dumps(runtime.get("counts", {})))
     UI.row("RECOVERY", "`bobocodexultra on` repairs a stopped service; `off` restores native desktop settings.")
@@ -572,8 +582,11 @@ def prepare(refresh: bool = False) -> dict[str, Path]:
     tomllib.loads(profile.decode())
     if not refresh:
         verify_managed(chosen, p)
-    write_if_new_or_equal(p["catalog"], catalog, refresh)
-    write_if_new_or_equal(p["profile"], profile, refresh)
+    for label, data in (("catalog", catalog), ("profile", profile)):
+        # A previous BCU version may have generated a narrower model catalog.
+        # Upgrade only if its recorded checksum proves this is still BCU's file.
+        owned = bool(chosen.get(label + "_sha256")) and p[label].exists() and sha(p[label].read_bytes()) == chosen[label + "_sha256"]
+        write_if_new_or_equal(p[label], data, refresh or owned)
     chosen.update(catalog_sha256=sha(catalog), profile_sha256=sha(profile))
     atomic_write(p["selection"], (json.dumps(chosen, indent=2) + "\n").encode())
     UI.done(f"Codex profile ready: {p['profile']}")

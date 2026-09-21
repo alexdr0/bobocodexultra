@@ -89,6 +89,8 @@ bobocodexultra doctor                                  # Inspect config and poss
 
 Relaunch Codex to refresh the selector. A user-level `model_reasoning_effort` or a task's explicit effort may override the catalog default; `doctor` displays a global effort if present. The router forwards low/medium/high on BCU requests but caps incoming `xhigh`, `max`, or `ultra` to `high` for its OpenRouter route. Provider support varies, so test a short task when changing effort; an upstream model can reject an unsupported value. BCU never rewrites native model entries to force these options.
 
+If a `(BCU)` model in the Codex Desktop selector shows only **High** and will not let you choose Low or Medium, an older BCU-generated catalog may still advertise just one level. Run `bobocodexultra doctor` to check **GUI THINKING**, then `bobocodexultra model sync` to regenerate the catalog safely. Fully quit and reopen Codex Desktop; its catalog is loaded at startup, so an already-open task may still show the old choices. New BCU installations upgrade checksum-verified older catalogs automatically; files modified outside BCU are never silently replaced. This changes only BCU entries, not native/Ollama capabilities or your API key.
+
 ## macOS menu bar
 
 `bobocodexultra menu install` builds the native Swift companion into `~/Applications/Bobo Codex Ultra.app`, opens it, and enables Launch at Login using a per-user LaunchAgent. Its icon is an **Inter Bold B inside a square outline with sharp corners**. The monochrome menu bar version adapts to light/dark appearances; the Applications icon is white on black. The letter is a vector outline, so Inter does not need to be installed. There is no Dock icon.
