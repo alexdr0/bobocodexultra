@@ -1915,6 +1915,14 @@ def install() -> None:
         if menu_target.exists() and b"enum BCUIcon" not in menu_target.read_bytes()[:1024]:
             raise SetupError("An unrelated BCUStatus.swift already exists beside the CLI.")
         atomic_write(menu_target, menu_source.read_bytes())
+        for name in ("LICENSE", "INTER-LICENSE.txt"):
+            candidates = (source.with_name(name), source.parent / "docs" / name, source.with_name("BCU-" + name))
+            origin = next((path for path in candidates if path.is_file()), None)
+            if origin:
+                destination = target.with_name("BCU-" + name)
+                if destination.is_symlink() or (destination.exists() and destination.read_bytes() != origin.read_bytes()):
+                    raise SetupError(f"Refusing to overwrite a changed license file: {destination.name}")
+                atomic_write(destination, origin.read_bytes())
         atomic_write(target, source.read_bytes(), 0o700)
     if not alias.is_symlink():
         alias.symlink_to(target.name)
@@ -1925,11 +1933,47 @@ def install() -> None:
         UI.row("NEXT", "Run `bobocodexultra docs` from any directory.")
 
 
-def menu_install() -> None:
+def desktop_snapshot() -> dict:
+    """Non-secret settings for the native app; never read credential values."""
+    p = paths()
+    config = tomllib.loads(p["config"].read_text()) if p["config"].exists() else {}
+    agents = config.get("agents", {})
+    return {"python": f"{sys.version_info.major}.{sys.version_info.minor}",
+            "codex_available": shutil.which("codex") is not None,
+            "cli_installed": (Path.home() / ".local/bin/bobocodexultra").is_file(),
+            "models": selection()["models"], "default_model": selection()["default"],
+            "agent_model": agents.get("default_subagent_model", ""),
+            "agent_reasoning": agents.get("default_subagent_reasoning_effort", "high"),
+            "agent_limit": agents.get("max_concurrent_threads_per_session", 2),
+            "agents_managed": agents_state_path().exists(),
+            "traffic": router_module().traffic_settings(p["home"] / "bcu/traffic.json")}
+
+
+def desktop_traffic(updates: list[str]) -> None:
+    path = paths()["home"] / "bcu/traffic.json"
+    if path.is_symlink():
+        raise SetupError("Traffic config is a symlink; refusing to replace it.")
+    current = router_module().traffic_settings(path)
+    for update in updates:
+        key, separator, raw = update.partition("=")
+        if not separator or key not in current:
+            raise SetupError("Use a supported traffic setting as name=value.")
+        try:
+            current[key] = json.loads(raw)
+        except ValueError as exc:
+            raise SetupError(f"Invalid traffic setting: {key}.") from exc
+    validated = router_module().traffic_settings(overrides=current)
+    if path.exists():
+        backup = path.with_name(f"traffic.backup-{time.time_ns()}.json")
+        atomic_write(backup, path.read_bytes())
+    atomic_write(path, (json.dumps(validated, indent=2) + "\n").encode())
+    UI.done("Traffic settings saved. Apply with `on` after active requests finish; the running router is unchanged.")
+
+
+def build_desktop_bundle(bundle: Path, *, python_hint: bool = False) -> None:
+    """Build a relocatable app with public source only, no local runtime state."""
     ensure_macos()
-    install()
     source = Path(__file__).resolve().with_name("BCUStatus.swift")
-    bundle = Path.home() / "Applications" / "Bobo Codex Ultra.app"
     contents = bundle / "Contents"
     executable = contents / "MacOS" / "BCU Menu"
     identifier = "com.bobocodexultra.menubar"
@@ -1942,7 +1986,9 @@ def menu_install() -> None:
     with tempfile.TemporaryDirectory(prefix="bcu-menu-") as folder:
         staging = Path(folder)
         built = staging / "BCU Menu"
-        result = subprocess.run(["/usr/bin/swiftc", "-O", "-framework", "AppKit", "-framework", "SwiftUI",
+        result = subprocess.run(["/usr/bin/swiftc", "-O", "-target", f"{os.uname().machine}-apple-macos13.0",
+                                 "-file-prefix-map", str(source.parent) + "=/BCU",
+                                 "-framework", "AppKit", "-framework", "SwiftUI",
                                  str(source), "-o", str(built)], capture_output=True, text=True, check=False)
         if result.returncode:
             raise SetupError("Could not compile BCU Menu:\n" + result.stderr[-3000:])
@@ -1965,46 +2011,106 @@ def menu_install() -> None:
                           capture_output=True, check=False).returncode:
             raise SetupError("Could not package the BCU application icon.")
         info = {"CFBundleIdentifier": identifier, "CFBundleName": "Bobo Codex Ultra",
-                "BCUPythonExecutable": str(Path(sys.executable).resolve()),
                 "CFBundleDisplayName": "Bobo Codex Ultra", "CFBundleExecutable": "BCU Menu",
-                "CFBundlePackageType": "APPL", "CFBundleVersion": "1", "CFBundleShortVersionString": "1.0",
+                "CFBundlePackageType": "APPL", "CFBundleVersion": "3", "CFBundleShortVersionString": "0.3.0",
                 "CFBundleIconFile": "AppIcon", "LSUIElement": True, "NSHighResolutionCapable": True,
                 "NSMinimumSystemVersion": "13.0",
                 "NSAppTransportSecurity": {"NSAllowsLocalNetworking": True}}
+        if python_hint:
+            info["BCUPythonExecutable"] = str(Path(sys.executable).resolve())
         atomic_write(contents / "Info.plist", plistlib.dumps(info))
         atomic_write(executable, built.read_bytes(), 0o755)
         atomic_write(contents / "Resources/AppIcon.icns", packaged.read_bytes())
+        # Explicit allowlist: never copy a user's config, database, keys or logs.
+        for name in ("openrouter-codex", "bcu_router.py", "bcu_games.py", "bcu_doom_render.py", "BCUStatus.swift"):
+            origin = Path(__file__).resolve() if name == "openrouter-codex" else source.with_name(name)
+            atomic_write(contents / "Resources" / name, origin.read_bytes(), 0o755 if name == "openrouter-codex" else 0o644)
+        for name in ("LICENSE", "INTER-LICENSE.txt"):
+            candidates = (source.with_name(name), source.parent / "docs" / name, source.with_name("BCU-" + name))
+            origin = next((path for path in candidates if path.is_file()), None)
+            if origin:
+                atomic_write(contents / "Resources" / name, origin.read_bytes(), 0o644)
     signed = subprocess.run(["/usr/bin/codesign", "--force", "--deep", "--sign", "-", str(bundle)],
                             capture_output=True, text=True, check=False)
     if signed.returncode:
         raise SetupError("App installed but local signing failed:\n" + signed.stderr[-1000:])
+
+
+def desktop_package(output: Path) -> None:
+    ensure_macos()
+    output = output.expanduser().resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    arch = os.uname().machine
+    destination = output / f"BoboCodexUltra-0.3.0-{arch}.dmg"
+    if destination.exists():
+        raise SetupError("That disk image already exists; choose a new output directory.")
+    with tempfile.TemporaryDirectory(prefix="bcu-desktop-package-") as folder:
+        staging = Path(folder)
+        build_desktop_bundle(staging / "Bobo Codex Ultra.app")
+        (staging / "Applications").symlink_to("/Applications")
+        atomic_write(staging / "Start Here.txt", (
+            "Bobo Codex Ultra\n\n1. Drag Bobo Codex Ultra to Applications.\n"
+            "2. Open it and follow Setup. Python 3.14+ and Codex are required; Setup checks them.\n"
+            "3. Add your OpenRouter key in Account, choose models, then enable routing.\n\n"
+            "This build is locally signed, not Apple notarized. Only open software you trust; "
+            "BCU never disables Gatekeeper. No account data or credentials are included.\n"
+            "https://github.com/alexdr0/bobocodexultra\n").encode(), 0o644)
+        result = subprocess.run(["/usr/bin/hdiutil", "create", "-volname", "Bobo Codex Ultra",
+                                 "-srcfolder", str(staging), "-format", "UDZO", str(destination)],
+                                capture_output=True, text=True, check=False)
+        if result.returncode:
+            raise SetupError("Could not build disk image: " + result.stderr[-1000:])
+    UI.done(f"Built {destination.name}")
+    UI.row("PATH", str(destination))
+    UI.row("SIGNING", "Ad-hoc signed, not notarized. See docs/DESKTOP.md before distribution.")
+
+
+def menu_install() -> None:
+    ensure_macos()
+    install()
+    bundle = Path.home() / "Applications" / "Bobo Codex Ultra.app"
+    build_desktop_bundle(bundle, python_hint=True)
+    identifier = "com.bobocodexultra.menubar"
+    executable = bundle / "Contents/MacOS/BCU Menu"
     agent = Path.home() / "Library/LaunchAgents" / f"{identifier}.plist"
     if agent.exists() and plistlib.loads(agent.read_bytes()).get("Label") != identifier:
         raise SetupError(f"{agent} is not a BCU login item; refusing to overwrite it.")
-    entry = {"Label": identifier, "ProgramArguments": [str(executable)], "RunAtLoad": True,
+    entry = {"Label": identifier, "ProgramArguments": [str(executable), "--background"], "RunAtLoad": True,
              "KeepAlive": False, "EnvironmentVariables": {"CODEX_HOME": str(paths()["home"])}}
     atomic_write(agent, plistlib.dumps(entry))
     launched = subprocess.run(["/usr/bin/open", "-a", str(bundle)], capture_output=True, text=True, check=False)
     if launched.returncode:
         raise SetupError("App installed and set to launch at login, but macOS could not open it: " + launched.stderr[-500:])
-    UI.done("BCU Menu is in the menu bar and will launch at login.")
+    UI.done("BCU Desktop is installed, with its shared menu icon and launch-at-login enabled.")
     UI.row("APP", str(bundle), "mint")
-    UI.row("TIP", "Quit BCU Menu from the icon; the model router keeps running until you turn it off.")
+    UI.row("TIP", "Quit BCU closes the window and icon; the independent model router keeps running.")
 
 
 def menu_open() -> None:
-    bundle = Path.home() / "Applications" / "Bobo Codex Ultra.app"
+    candidates = (Path("/Applications/Bobo Codex Ultra.app"), Path.home() / "Applications/Bobo Codex Ultra.app")
+    bundle = next((candidate for candidate in candidates if candidate.is_dir()), candidates[1])
     if not bundle.is_dir():
         menu_install()
         return
+    info = bundle / "Contents/Info.plist"
+    if not info.is_file() or plistlib.loads(info.read_bytes()).get("CFBundleIdentifier") != "com.bobocodexultra.menubar":
+        raise SetupError("The application at that location is not a BCU installation.")
     result = subprocess.run(["/usr/bin/open", "-a", str(bundle)], capture_output=True, check=False)
     if result.returncode:
         raise SetupError("macOS could not open BCU Menu. Run `bobocodexultra menu install` to repair it.")
-    UI.done("BCU Menu is open; find the boxed B icon in the menu bar.")
+    UI.done("BCU Desktop is open; its boxed B menu icon uses the same settings.")
 
 
 def docs(topic: str) -> None:
     sections = {
+        "app": [
+            ("app", "Open BCU Desktop: Setup, Models, Account, Agents, Routing, Usage and Settings share one menu icon."),
+            ("app install", "Compile and install the desktop app locally; requires Apple's Swift compiler."),
+            ("app build [--output DIRECTORY]", "Build a relocatable drag-to-Applications disk image; no private state is included."),
+            ("app status", "Read non-secret settings as JSON; never retrieves an API key."),
+            ("app traffic name=value ...", "Validate and save routing limits; does not restart active requests."),
+            ("distribution", "Python 3.14+ remains required. Disk images are locally signed, not Apple-notarized."),
+        ],
         "auth": [
             ("login", "Store the key in macOS Keychain and enable the shared desktop selector."),
             ("auth login --no-desktop", "Store or replace the key without changing desktop mode."),
@@ -2032,7 +2138,7 @@ def docs(topic: str) -> None:
             ("on", "Start BCU locally and combine native, Ollama, and BCU models in Codex Desktop."),
             ("off", "Restore your previous desktop settings while preserving unrelated edits."),
             ("doctor", "Check the desktop endpoint, service, and combined catalog."),
-            ("menu", "Open or install the BCU macOS menu bar companion."),
+            ("menu", "Compatibility alias for the unified BCU desktop app and menu icon."),
             ("menu install", "Build a signed local app, open it, and launch it automatically at login."),
         ],
         "traffic": [
@@ -2089,7 +2195,7 @@ def docs(topic: str) -> None:
         UI.row("usage", "Desktop and legacy OpenRouter tokens, reported costs and clearly marked estimates.")
         UI.row("snake / pong / doom", "Play offline terminal arcade games; `docs games` shows controls.")
         UI.row("reset", "Alias for off.")
-        UI.row("docs [topic]", "Read these built-in docs; topics: setup, auth, model, agents, desktop, codex, traffic, usage, games.")
+        UI.row("docs [topic]", "Read these built-in docs; topics: app, setup, auth, model, agents, desktop, codex, traffic, usage, games.")
         UI.row("install", "Update both names in ~/.local/bin from this executable.")
         UI.row("ALIAS", "boboultracodex works identically to bobocodexultra.", "pink")
     UI.section("Safety")
@@ -2136,6 +2242,14 @@ def main() -> None:
     traffic_parser.add_argument("--json", action="store_true", help="Emit a machine-readable scheduler snapshot")
     menu_parser = sub.add_parser("menu", help="Open or install the native macOS menu bar app")
     menu_parser.add_argument("action", nargs="?", choices=("open", "install"), default="open")
+    app_sub = sub.add_parser("app", help="Open, install or package BCU Desktop").add_subparsers(dest="action")
+    app_sub.add_parser("open", help="Open the unified desktop app")
+    app_sub.add_parser("install", help="Build and install BCU Desktop")
+    app_sub.add_parser("status", help="Non-secret desktop settings as JSON")
+    app_build = app_sub.add_parser("build", help="Build a relocatable drag-to-Applications disk image")
+    app_build.add_argument("--output", type=Path, default=Path("dist"))
+    app_traffic = app_sub.add_parser("traffic", help="Save validated traffic settings without restarting the router")
+    app_traffic.add_argument("settings", nargs="+", help="name=value; e.g. openrouter_concurrency=8")
     usage_parser = sub.add_parser("usage", help="Report desktop/CLI OpenRouter tokens, reported costs and estimates")
     usage_parser.add_argument("--days", type=int, default=30, help="Lookback days; 0 means all retained history")
     usage_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
@@ -2156,7 +2270,7 @@ def main() -> None:
     for game in ("snake", "pong", "doom"):
         sub.add_parser(game, help=f"Play {game.capitalize()} offline in the terminal")
     docs_parser = sub.add_parser("docs", help="Read built-in command documentation")
-    docs_parser.add_argument("topic", nargs="?", choices=("setup", "auth", "model", "agents", "desktop", "codex", "traffic", "usage", "games"), default="all")
+    docs_parser.add_argument("topic", nargs="?", choices=("app", "setup", "auth", "model", "agents", "desktop", "codex", "traffic", "usage", "games"), default="all")
     desktop_sub = sub.add_parser("desktop", help="Control shared desktop routing (shortcuts: on / off)").add_subparsers(dest="action", required=True)
     desktop_sub.add_parser("on", help="Enable ChatGPT, Ollama and BCU models side by side")
     desktop_sub.add_parser("off", help="Restore the previous native/Ollama desktop configuration")
@@ -2186,7 +2300,7 @@ def main() -> None:
         UI.motion = False
     if args.no_animate:
         UI.motion = False
-    if args.command not in ("snake", "pong", "doom") and (args.command != "codex" or args.action != "launch") and not (args.command in ("usage", "traffic") and args.json):
+    if args.command not in ("snake", "pong", "doom") and (args.command != "codex" or args.action != "launch") and not (args.command == "app" and args.action == "status") and not (args.command in ("usage", "traffic") and args.json):
         UI.heading({"setup": "Guided setup", "auth": "Secure access", "model": "Model selector", "reasoning": "Reasoning control",
                     "agents": "Codex agents", "desktop": "Desktop mode",
                     "codex": "Codex operations", "docs": "Field guide", "status": "System check",
@@ -2217,6 +2331,17 @@ def main() -> None:
             traffic_status(args.json)
         elif args.command == "menu":
             menu_install() if args.action == "install" else menu_open()
+        elif args.command == "app":
+            if args.action == "status":
+                print(json.dumps(desktop_snapshot()))
+            elif args.action == "traffic":
+                desktop_traffic(args.settings)
+            elif args.action == "build":
+                desktop_package(args.output)
+            elif args.action == "install":
+                menu_install()
+            else:
+                menu_open()
         elif args.command == "usage":
             usage(args.days, args.json, args.offline, args.refresh_prices)
         elif args.command == "reset":

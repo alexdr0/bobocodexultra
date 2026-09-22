@@ -22,6 +22,10 @@ The threaded router uses separate native/OpenRouter queues and active limits, wi
 
 The health endpoint, `traffic`, and `doctor` expose queue depths, active counts, retry totals, and bounded in-memory error metadata (route, model, status, time, and parsed retry delay), never upstream error bodies or credentials. Request counters count upstream attempts, including retries and unsuccessful responses. Diagnostics reset on service restart. See [Traffic control](TRAFFIC.md) for resource bounds and the exact retry policy.
 
+## Desktop control plane
+
+`BCUStatus.swift` now owns one native desktop window, first-run setup assistant and menu-bar icon. The app invokes its bundled public CLI through a detected Python 3.14+ interpreter; configuration writes retain the CLI's existing validation, backups and ownership checks. `app status` supplies a non-secret settings snapshot. `app traffic` validates and saves limits without restarting the router; applying them is a separate explicit action. Secure credential entry goes directly to macOS Keychain, never through subprocess arguments. The desktop UI and menu share one store, while inference routing remains an independent LaunchAgent. See [Desktop setup](DESKTOP.md) and [Menu lifecycle](MENUBAR.md).
+
 ## Compatibility limits
 
 OpenRouter's Responses API is stateless, so BCU sends full visible history with `store=false`; a native `previous_response_id` cannot be resumed there. Provider-encrypted reasoning cannot be transferred, and opaque native compaction state cannot be converted to OpenRouter. Start a new Codex task with a visible summary when changing providers after compaction. OpenRouter does not provide Codex's native `/responses/compact` route. Unsupported tool types are rejected rather than silently dropped.

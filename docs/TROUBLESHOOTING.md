@@ -46,6 +46,18 @@ If the task contains provider-specific compacted or encrypted reasoning history,
 
 Older releases read only the dedicated OpenRouter CLI profile and missed shared desktop requests. Update/install the CLI, then run `bobocodexultra usage --offline --days 0`. The command now reads the existing `$CODEX_HOME/bcu/usage.sqlite3` ledger alongside legacy CLI records; previously recorded desktop history is retained. Use `--days 0` to include records older than the default 30-day window. Native ChatGPT/Ollama calls are intentionally excluded.
 
-For the graphical view, quit the old menu companion, run `bobocodexultra menu install`, then choose **Usage & Costs…**. The installer pins the Python interpreter used to build the app so a Finder/login launch does not depend on your shell's PATH. Reinstall if that interpreter moves. No router or Codex restart is needed for reporting changes.
+For the graphical view, quit the old menu companion, run `bobocodexultra app install`, then choose **Usage & Costs…** or the desktop **Usage** page. The app uses its bundled CLI and detects Python independently of shell initialization. If Python moves, choose **Detect again** in Setup. No router or Codex restart is needed for reporting changes.
 
 An unreadable ledger produces a warning and a partial report, not a false zero total. Missing prices produce a known-cost subtotal; `usage --refresh-prices` refreshes fallback public pricing without reading your API key. Retired model IDs may still have no price. Do not delete the ledger to repair a report; it contains your retained desktop history. See [Usage accounting](USAGE.md).
+
+## Desktop setup cannot continue
+
+Use **Setup → Check → Check prerequisites**. The desktop app needs Python 3.14+ even when installed from a disk image. Install Python and Codex from their official sources, then use **Detect again**. If existing Codex configuration is invalid, the preflight reports it and does not overwrite it. The app's CLI repair action reinstalls the bundled public files without changing routing.
+
+## macOS warns about the downloaded app
+
+Current disk images are locally signed, not Developer ID signed or Apple-notarized. BCU does not bypass Gatekeeper. Use the source build if you do not want to trust an unnotarized download; see [Desktop distribution](DESKTOP.md#build-and-distribution). Do not confuse an Apple Development certificate with a Developer ID distribution certificate.
+
+## Duplicate or old menu icon
+
+Quit the old BCU Menu before installing the desktop version. They share the same bundle identifier and login-item label, and the new app prevents multiple instances from running. Avoid keeping separate copies in both system and user Applications folders. Closing the window intentionally leaves the menu icon running; **Quit BCU** closes both without stopping the router.
