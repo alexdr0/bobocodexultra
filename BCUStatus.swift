@@ -84,6 +84,40 @@ struct RouterHealth: Decodable {
     let models: Int
 }
 
+struct UsageReport: Decodable {
+    let periodDays: Int
+    let generatedAt: String
+    let pricingCatalogFetchedAt: String
+    let ledgerStatus: String
+    let warnings: [String]
+    let summary: UsageTotals
+    let models: [String: UsageTotals]
+}
+
+struct UsageTotals: Decodable {
+    let displayName: String?
+    let records: Int
+    let desktopRequests: Int
+    let legacyRecords: Int
+    let inputTokens: Int
+    let cachedInputTokens: Int
+    let outputTokens: Int
+    let reasoningOutputTokens: Int
+    let totalTokens: Int
+    let reportedCostUsd: Double
+    let estimatedCostUsd: Double
+    let knownCostUsd: Double
+    let totalCostUsd: Double?
+    let costSource: String
+    let unpricedRecords: Int
+}
+
+struct UsageRow: Identifiable {
+    let id: String
+    let totals: UsageTotals
+    var name: String { totals.displayName ?? id }
+}
+
 struct ModelCatalog: Decodable { let data: [RouterModel] }
 struct RouterModel: Decodable, Identifiable {
     let id: String
@@ -107,6 +141,10 @@ final class BCUStore: ObservableObject {
     @Published var selected = Set<String>()
     @Published var defaultID = ""
     @Published var models: [RouterModel] = []
+    @Published var usageReport: UsageReport?
+    @Published var usageDays = 30
+    @Published var usageBusy = false
+    @Published var usageNotice = ""
     private var selectedMetadata: [RouterModel] = []
     private let home: URL
     let cli: URL
@@ -163,12 +201,9 @@ final class BCUStore: ObservableObject {
         guard !busy else { return }
         busy = true
         notice = "Working…"
-        let path = cli
+        let process = cliProcess(arguments)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let process = Process()
-            process.executableURL = path
-            process.arguments = ["--no-color", "--no-animate"] + arguments
-            process.standardOutput = Pipe()
+            process.standardOutput = FileHandle.nullDevice
             let errors = Pipe()
             process.standardError = errors
             do {
@@ -186,6 +221,172 @@ final class BCUStore: ObservableObject {
         }
     }
 
+    private func cliProcess(_ arguments: [String]) -> Process {
+        let process = Process()
+        // Finder/login launches do not inherit an interactive shell's Python.
+        if let python = Bundle.main.infoDictionary?["BCUPythonExecutable"] as? String,
+           FileManager.default.isExecutableFile(atPath: python) {
+            process.executableURL = URL(fileURLWithPath: python)
+            process.arguments = [cli.path, "--no-color", "--no-animate"] + arguments
+        } else {
+            process.executableURL = cli
+            process.arguments = ["--no-color", "--no-animate"] + arguments
+        }
+        var environment = ProcessInfo.processInfo.environment
+        environment["CODEX_HOME"] = home.path
+        environment["PATH"] = NSHomeDirectory() + "/.local/bin:/opt/homebrew/bin:/usr/local/bin:" + (environment["PATH"] ?? "/usr/bin:/bin")
+        process.environment = environment
+        return process
+    }
+
+    func loadUsage(refreshPrices: Bool = false) {
+        guard !usageBusy else { return }
+        usageBusy = true
+        usageNotice = ""
+        let process = cliProcess(["usage", "--json", "--days", String(usageDays),
+                                  refreshPrices ? "--refresh-prices" : "--offline"])
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                try process.run()
+                DispatchQueue.global().asyncAfter(deadline: .now() + 45) {
+                    if process.isRunning { process.terminate() }
+                }
+                // Drain while the CLI runs so a large model report cannot fill
+                // the pipe and deadlock waitUntilExit().
+                let data = output.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                let decoder = JSONDecoder()
+                decoder.keyDecodingStrategy = .convertFromSnakeCase
+                let report = process.terminationStatus == 0 ? try? decoder.decode(UsageReport.self, from: data) : nil
+                DispatchQueue.main.async {
+                    self?.usageBusy = false
+                    if let report { self?.usageReport = report }
+                    else { self?.usageNotice = "Could not load usage. Try bobocodexultra usage --offline in Terminal, or reinstall the CLI." }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self?.usageBusy = false
+                    self?.usageNotice = "BCU CLI could not start. Run bobocodexultra install, then reopen this window."
+                }
+            }
+        }
+    }
+}
+
+struct UsageView: View {
+    @ObservedObject var store: BCUStore
+    @State private var search = ""
+    @State private var sorting = "Tokens"
+    private func money(_ amount: Double) -> String { String(format: "$%.6f", amount) }
+
+    private var rows: [UsageRow] {
+        let all = (store.usageReport?.models ?? [:]).map { UsageRow(id: $0.key, totals: $0.value) }
+        let filtered = all.filter { search.isEmpty || ($0.name + " " + $0.id).localizedCaseInsensitiveContains(search) }
+        return filtered.sorted {
+            switch sorting {
+            case "Name": return $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+            case "Cost": return ($0.totals.knownCostUsd, $0.id) > ($1.totals.knownCostUsd, $1.id)
+            default: return ($0.totals.totalTokens, $0.id) > ($1.totals.totalTokens, $1.id)
+            }
+        }
+    }
+
+    private func metric(_ label: String, _ value: String, _ note: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(label).font(.caption).foregroundStyle(.secondary)
+            Text(value).font(.title3.bold()).monospacedDigit().lineLimit(1).minimumScaleFactor(0.7)
+            Text(note).font(.caption2).foregroundStyle(.secondary)
+        }.frame(maxWidth: .infinity, alignment: .leading).padding(12)
+            .background(Color.primary.opacity(0.045)).clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Image(nsImage: BCUIcon.draw(30, template: false)).resizable().frame(width: 30, height: 30)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Usage & Costs").font(.title2.bold())
+                    Text("OpenRouter activity through BCU").font(.subheadline).foregroundStyle(.secondary)
+                }
+                Spacer()
+                if store.usageBusy { ProgressView().controlSize(.small) }
+                Button("Refresh") { store.loadUsage() }.disabled(store.usageBusy)
+                Button("Refresh Prices") { store.loadUsage(refreshPrices: true) }.disabled(store.usageBusy)
+                    .help("Fetch OpenRouter's public pricing catalog for records without reported costs. No API key or model call.")
+            }
+            HStack {
+                Picker("Period", selection: $store.usageDays) {
+                    Text("24 hours").tag(1)
+                    Text("7 days").tag(7)
+                    Text("30 days").tag(30)
+                    Text("All time").tag(0)
+                }.pickerStyle(.segmented).frame(width: 340).disabled(store.usageBusy)
+                Spacer()
+                Text("Native ChatGPT / Ollama excluded").font(.caption).foregroundStyle(.secondary)
+            }
+            if !store.usageNotice.isEmpty {
+                Text(store.usageNotice).font(.callout).foregroundStyle(.orange)
+            }
+            if let report = store.usageReport, report.periodDays == store.usageDays {
+                let summary = report.summary
+                HStack(spacing: 10) {
+                    metric("Recorded tokens", summary.totalTokens.formatted(), "Input + output; includes cached tokens")
+                    metric("Reported cost", money(summary.reportedCostUsd), "From provider responses")
+                    metric("Estimated cost", money(summary.estimatedCostUsd), "Catalog fallback only")
+                    metric("Known cost", money(summary.knownCostUsd), summary.costSource == "partial" ? "Partial subtotal" : "Reported + estimated")
+                }
+                HStack(spacing: 18) {
+                    Text("Input \(summary.inputTokens.formatted())")
+                    Text("Cached \(summary.cachedInputTokens.formatted())")
+                    Text("Output \(summary.outputTokens.formatted())")
+                    Text("Reasoning \(summary.reasoningOutputTokens.formatted()) included")
+                }.font(.caption).monospacedDigit().foregroundStyle(.secondary)
+                Text("\(summary.desktopRequests.formatted()) desktop requests · \(summary.legacyRecords.formatted()) legacy CLI records")
+                    .font(.caption).foregroundStyle(.secondary)
+                ForEach(report.warnings, id: \.self) { warning in
+                    Label(warning, systemImage: "exclamationmark.triangle").font(.caption).foregroundStyle(.orange)
+                }
+                HStack {
+                    TextField("Search models", text: $search).textFieldStyle(.roundedBorder)
+                    Picker("Sort", selection: $sorting) {
+                        ForEach(["Tokens", "Cost", "Name"], id: \.self) { Text($0) }
+                    }.frame(width: 170)
+                }
+                if report.models.isEmpty {
+                    VStack(spacing: 8) {
+                        Image(systemName: "chart.bar.xaxis").font(.largeTitle).foregroundStyle(.secondary)
+                        Text("No recorded usage for this period").font(.headline)
+                        Text("Completed OpenRouter responses appear here when they include usage counters.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }.frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    Table(rows) {
+                        TableColumn("Model") { row in
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(row.name).fontWeight(.medium)
+                                Text(row.id).font(.caption).foregroundStyle(.secondary)
+                            }.padding(.vertical, 3)
+                        }.width(min: 220, ideal: 290)
+                        TableColumn("Input") { row in Text(row.totals.inputTokens.formatted()).monospacedDigit() }.width(min: 90, ideal: 105)
+                        TableColumn("Output") { row in Text(row.totals.outputTokens.formatted()).monospacedDigit() }.width(min: 75, ideal: 85)
+                        TableColumn("Total") { row in Text(row.totals.totalTokens.formatted()).monospacedDigit() }.width(min: 90, ideal: 105)
+                        TableColumn("Known cost") { row in Text(money(row.totals.knownCostUsd)).monospacedDigit() }.width(min: 95, ideal: 105)
+                        TableColumn("Source") { row in Text(row.totals.costSource.capitalized).foregroundStyle(.secondary) }.width(min: 65, ideal: 80)
+                    }
+                }
+                Text("Pricing catalog: \(report.pricingCatalogFetchedAt). Estimates use catalog prices, not historical invoices.")
+                    .font(.caption2).foregroundStyle(.secondary).textSelection(.enabled)
+            } else {
+                Text(store.usageBusy ? "Reading local usage…" : "Refresh to load usage.")
+                    .foregroundStyle(.secondary).frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }.padding(18).frame(minWidth: 860, minHeight: 590)
+            .onAppear { store.loadUsage() }
+            .onChange(of: store.usageDays) { _ in store.loadUsage() }
+    }
 }
 
 struct ManagerView: View {
@@ -260,6 +461,7 @@ final class StatusApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let store = BCUStore()
     private var item: NSStatusItem!
     private var window: NSWindow?
+    private var usageWindow: NSWindow?
     private var timer: Timer?
     private let loginLabel = "com.bobocodexultra.menubar"
     private var loginAgent: URL { URL(fileURLWithPath: NSHomeDirectory() + "/Library/LaunchAgents/" + loginLabel + ".plist") }
@@ -272,7 +474,10 @@ final class StatusApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let menu = NSMenu()
         menu.delegate = self
         item.menu = menu
-        timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in self?.store.reload() }
+        timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+            self?.store.reload()
+            if self?.usageWindow?.isVisible == true { self?.store.loadUsage() }
+        }
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
@@ -291,6 +496,9 @@ final class StatusApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let manage = NSMenuItem(title: "Manage Models…", action: #selector(showModels), keyEquivalent: "m")
         manage.target = self
         menu.addItem(manage)
+        let usage = NSMenuItem(title: "Usage & Costs…", action: #selector(showUsage), keyEquivalent: "u")
+        usage.target = self
+        menu.addItem(usage)
         let account = NSMenuItem(title: "Enter OpenRouter Key…", action: #selector(openLogin), keyEquivalent: "")
         account.target = self
         menu.addItem(account)
@@ -330,6 +538,20 @@ final class StatusApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
         process.arguments = ["-e", "tell application \"Terminal\" to do script \"\(appleString)\""]
         try? process.run()
+    }
+    @objc private func showUsage() {
+        if usageWindow == nil {
+            let controller = NSHostingController(rootView: UsageView(store: store))
+            let created = NSWindow(contentViewController: controller)
+            created.title = "BCU · Usage & Costs"
+            created.setContentSize(NSSize(width: 960, height: 650))
+            created.center()
+            created.isReleasedWhenClosed = false
+            usageWindow = created
+        }
+        store.loadUsage()
+        usageWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
     @objc private func openCodex() {
         let path = "/Applications/ChatGPT.app"

@@ -10,4 +10,12 @@ The icon app and router are separate processes and separate login items. **Quit 
 
 The manager fetches OpenRouter's public tool-capable catalog. If the catalog cannot be fetched, it explains the network failure; existing selected models remain in its local state. The menu's status refreshes periodically, but the Codex model picker itself loads at app startup. On this Mac the Codex desktop bundle is `/Applications/ChatGPT.app`; if installed elsewhere, the **Open Codex Desktop** action reports that it could not find the app rather than guessing.
 
+## Usage & Costs
+
+Choose **Usage & Costs…** to open the shared desktop/legacy OpenRouter usage report. Date filters, model search and token/cost/name sorting accompany separate reported, estimated and known-cost totals. Cached and reasoning counts are visible without double counting. Unknown prices and unreadable history show warnings instead of silently claiming a complete total. Native ChatGPT and Ollama requests are excluded.
+
+The window refreshes local history every 15 seconds while visible. **Refresh** reads local data and cached prices only; **Refresh Prices** fetches OpenRouter's public catalog for fallback estimates. Neither operation reads your API key or makes a model call. See [Usage accounting](USAGE.md) for details.
+
+Quit the old companion before `bobocodexultra menu install` to load an updated binary. This does not interrupt the router or require a Codex restart. The installer records its Python interpreter in the app bundle so launch from Finder/login works without shell initialization. If you move or remove that Python installation, reinstall the menu app using the replacement interpreter.
+
 To build manually for development on macOS, use `swiftc -O -framework AppKit -framework SwiftUI BCUStatus.swift -o /tmp/bcu-menu-dev`; the packaged installer also creates `.icns`, `Info.plist` and the login item. The menu requires macOS 13 or later and Apple's Swift compiler. The router/CLI requires Python 3.14 or later for built-in zstd decompression.

@@ -209,7 +209,18 @@ bobocodexultra codex smoke --agents  # Optional billed check
 
 ## Usage and appearance
 
-The router records successful OpenRouter response usage in a private local SQLite ledger, using response IDs to avoid duplicates. It stores model IDs, timestamps, counters and reported cost only. The current `bobocodexultra usage` command reports **legacy OpenRouter CLI-profile sessions only**; shared desktop usage is not included in that command yet. No cost total is presented as an invoice. The ledger path is `$CODEX_HOME/bcu/usage.sqlite3` (default `~/.codex/bcu/usage.sqlite3`).
+Run `bobocodexultra usage` or choose **Usage & Costs…** from the BCU menu-bar icon to see shared desktop usage and legacy OpenRouter CLI-profile usage together. Reports show per-model input, cached input, output and total tokens, provider-reported costs, and separately labeled catalog estimates when reported costs are missing. Native ChatGPT and Ollama usage is excluded. Unknown prices are flagged as partial, not silently priced at zero.
+
+```sh
+bobocodexultra usage                   # Last 30 days
+bobocodexultra usage --days 7           # Last week; --days 0 for all history
+bobocodexultra usage --offline         # Local history and cached prices only
+bobocodexultra usage --refresh-prices  # Refresh public fallback pricing
+bobocodexultra usage --json            # Machine-readable report
+bobocodexultra docs usage              # Built-in guide
+```
+
+The router records successful OpenRouter response usage in a private local SQLite ledger, using response IDs to avoid duplicates. It stores model IDs, timestamps, counters and reported cost only, at `$CODEX_HOME/bcu/usage.sqlite3` (default `~/.codex/bcu/usage.sqlite3`). Reports do not require an API key. No total is presented as an invoice; see [Usage accounting](docs/USAGE.md) for cost semantics, completeness and privacy. Update the CLI and reinstall the menu app to pick up this view; no Codex or router restart is needed for this reporting update.
 
 Color and animation respect `NO_COLOR`, `CI`, `TERM=dumb`, `BOBOCODEXULTRA_NO_ANIM`, `--no-color` and `--no-animate`. Noninteractive output is plain text.
 

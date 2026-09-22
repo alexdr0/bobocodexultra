@@ -8,17 +8,19 @@ The macOS `security` command prompts for it and stores it in the login Keychain.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, closing
 import copy
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
+import http.client
 import importlib.util
 import json
 import os
 import plistlib
 import re
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -669,7 +671,7 @@ def openrouter_pricing_catalog() -> list[dict]:
                 if len(raw) > 12_000_000:
                     raise SetupError("OpenRouter pricing response is unexpectedly large.")
                 models = json.loads(raw)["data"]
-    except (urllib.error.URLError, KeyError, ValueError) as exc:
+    except (OSError, http.client.HTTPException, KeyError, ValueError, TypeError) as exc:
         raise SetupError(f"Could not load OpenRouter pricing: {exc}") from exc
     return [m for m in models if isinstance(m, dict) and isinstance(m.get("id"), str)
             and MODEL_ID.fullmatch(m["id"])]
@@ -1545,6 +1547,11 @@ def local_usage_records(home: Path, since: datetime | None = None) -> tuple[list
                     if kind == "session_meta":
                         provider = payload.get("model_provider")
                         session_id = str(payload.get("session_id") or payload.get("id") or session_id)
+                        if provider != "openrouter":
+                            # Shared desktop requests are accounted by response ID
+                            # in the router ledger. Do not parse their entire chat
+                            # histories or count their rollout counters again.
+                            break
                     elif kind == "turn_context":
                         current_model = payload.get("model") or current_model
                     if provider != "openrouter" or not current_model:
@@ -1559,7 +1566,7 @@ def local_usage_records(home: Path, since: datetime | None = None) -> tuple[list
                         turn_id = payload.get("turn_id") or payload.get("root_turn_id")
                     if not isinstance(usage, dict):
                         continue
-                    values = {key: int(usage.get(key) or 0) for key in
+                    values = {key: token_counter(usage.get(key)) for key in
                               ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
                                "output_tokens", "reasoning_output_tokens", "total_tokens")}
                     if not any(values.values()):
@@ -1573,7 +1580,7 @@ def local_usage_records(home: Path, since: datetime | None = None) -> tuple[list
                         record["_dedupe"] = ("event", session_id, stamp.isoformat() if stamp else "", current_model,
                                              *values.values())
                         event_records.append(record)
-        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, AttributeError, OverflowError):
             unreadable += 1
             continue
         # Newer Codex versions emit structured per-turn records. Older versions emit
@@ -1589,26 +1596,45 @@ def local_usage_records(home: Path, since: datetime | None = None) -> tuple[list
     return records, unreadable
 
 
-def usage_prices(refresh: bool = True) -> tuple[dict[str, dict], str]:
+def usage_prices(refresh: bool = True, force_refresh: bool = False) -> tuple[dict[str, dict], str]:
     p = paths()
     cache = p["usage_cache"]
+    cached = {}
+    if cache.exists():
+        try:
+            cached = json.loads(cache.read_text())
+            if not isinstance(cached, dict) or not isinstance(cached.get("prices"), dict):
+                cached = {}
+            else:
+                cached["prices"] = {model: value for model, value in cached["prices"].items()
+                                    if isinstance(model, str) and isinstance(value, dict)}
+                if not isinstance(cached.get("fetched_at"), str):
+                    cached["fetched_at"] = "unknown"
+        except (OSError, ValueError):
+            pass
+    fetched = parse_utc(cached.get("fetched_at"))
+    if not force_refresh and fetched and 0 <= (datetime.now(timezone.utc) - fetched).total_seconds() < 3600:
+        return cached["prices"], cached["fetched_at"]
     if refresh:
         try:
             models = openrouter_pricing_catalog()
             prices = {model["id"]: {
+                "name": safe_text(model.get("name") or model["id"]),
                 "prompt": str((model.get("pricing") or {}).get("prompt") or ""),
                 "completion": str((model.get("pricing") or {}).get("completion") or ""),
                 "cache_read": str((model.get("pricing") or {}).get("input_cache_read") or ""),
                 "cache_write": str((model.get("pricing") or {}).get("input_cache_write") or ""),
             } for model in models}
             data = {"fetched_at": datetime.now(timezone.utc).isoformat(), "prices": prices}
-            atomic_write(cache, (json.dumps(data, indent=2) + "\n").encode())
+            try:
+                atomic_write(cache, (json.dumps(data, indent=2) + "\n").encode())
+            except OSError:
+                pass  # A cache-write failure must not hide the usage report.
             return prices, data["fetched_at"]
         except SetupError:
             pass
-    if cache.exists():
-        data = json.loads(cache.read_text())
-        return data.get("prices", {}), data.get("fetched_at", "unknown")
+    if cached:
+        return cached["prices"], cached.get("fetched_at", "unknown")
     return {}, "unavailable"
 
 
@@ -1637,75 +1663,177 @@ def estimate_record_cost(record: dict, prices: dict) -> tuple[Decimal | None, bo
     return cost, cache_read is not None
 
 
-def usage(days: int, as_json: bool, offline: bool) -> None:
+USAGE_COUNTERS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+                  "output_tokens", "reasoning_output_tokens", "total_tokens")
+
+
+def reported_cost(value) -> Decimal | None:
+    try:
+        cost = Decimal(str(value))
+        return cost if cost.is_finite() and 0 <= cost <= Decimal("1e12") else None
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def token_counter(value) -> int:
+    if value is None:
+        return 0
+    if type(value) is bool or not isinstance(value, (int, str)):
+        raise ValueError("Invalid token counter")
+    count = int(value)
+    if count < 0 or count > 10**15:
+        raise ValueError("Invalid token counter")
+    return count
+
+
+def ledger_usage_records(home: Path, since: datetime | None = None) -> tuple[list[dict], str, int]:
+    """Read existing response-ID-deduplicated usage; never create/modify the ledger."""
+    path = home / "bcu" / "usage.sqlite3"
+    if not path.exists():
+        return [], "missing", 0
+    records, invalid = [], 0
+    try:
+        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=2)) as db:
+            sql = "SELECT timestamp, model, data FROM usage"
+            params = ()
+            if since is not None:
+                sql += " WHERE timestamp >= ?"
+                params = (since.timestamp(),)
+            for stamp, model, encoded in db.execute(sql, params):
+                try:
+                    raw = json.loads(encoded)
+                    incoming = raw.get("input_tokens_details") or {}
+                    outgoing = raw.get("output_tokens_details") or {}
+                    record = {
+                        "timestamp": datetime.fromtimestamp(stamp, timezone.utc), "model": model,
+                        "input_tokens": token_counter(raw.get("input_tokens")),
+                        "output_tokens": token_counter(raw.get("output_tokens")),
+                        "cached_input_tokens": token_counter(incoming.get("cached_tokens")),
+                        "cache_write_input_tokens": token_counter(incoming.get("cache_write_tokens")),
+                        "reasoning_output_tokens": token_counter(outgoing.get("reasoning_tokens")),
+                        "reported_cost_usd": reported_cost(raw.get("cost")), "source": "desktop",
+                    }
+                    record["total_tokens"] = (token_counter(raw["total_tokens"]) if raw.get("total_tokens") is not None
+                                              else record["input_tokens"] + record["output_tokens"])
+                    if not isinstance(model, str) or not model:
+                        raise ValueError("Missing model")
+                    records.append(record)
+                except (ValueError, TypeError, AttributeError, OverflowError, OSError):
+                    invalid += 1
+    except (sqlite3.Error, OSError):
+        return [], "unreadable", 0
+    return records, "available", invalid
+
+
+def build_usage_report(days: int, offline: bool, refresh_prices: bool = False) -> dict:
     if days < 0:
         raise SetupError("--days must be zero or greater; zero means all locally retained history.")
     since = None if days == 0 else datetime.now(timezone.utc) - timedelta(days=days)
-    records, unreadable = local_usage_records(paths()["home"], since)
-    prices, fetched = usage_prices(not offline)
-    totals: dict[str, dict] = {}
+    home = paths()["home"]
+    desktop, ledger_status, invalid = ledger_usage_records(home, since)
+    legacy, unreadable = local_usage_records(home, since)
+    records = desktop + [dict(record, source="legacy", reported_cost_usd=None) for record in legacy]
+    needs_prices = any(record["reported_cost_usd"] is None for record in records)
+    prices, fetched = usage_prices(not offline and (needs_prices or refresh_prices), force_refresh=refresh_prices)
+    names = {model["id"]: model["name"] for model in selection()["models"]}
+    warnings = []
+    if ledger_status == "unreadable":
+        warnings.append("The shared-router ledger could not be read; desktop usage is unavailable.")
+    if invalid:
+        warnings.append(f"Skipped {invalid} invalid ledger records; totals are incomplete.")
+    if unreadable:
+        warnings.append(f"Skipped {unreadable} unreadable legacy rollout files; totals may be incomplete.")
+
+    def bucket():
+        return dict.fromkeys(USAGE_COUNTERS, 0) | {
+            "records": 0, "desktop_requests": 0, "legacy_records": 0,
+            "reported_records": 0, "estimated_records": 0, "unpriced_records": 0,
+            "reported_cost_usd": Decimal(0), "estimated_cost_usd": Decimal(0),
+        }
+
+    totals, summary = {}, bucket()
     for record in records:
-        bucket = totals.setdefault(record["model"], {key: 0 for key in
-            ("turns", "input_tokens", "cached_input_tokens", "cache_write_input_tokens",
-             "output_tokens", "reasoning_output_tokens", "total_tokens")})
-        bucket["turns"] += 1
-        for key in bucket:
-            if key != "turns":
-                bucket[key] += record[key]
-    estimated_total = Decimal(0)
-    priced_models = 0
-    cache_discount_models = 0
-    for model, bucket in totals.items():
-        cost = Decimal(0)
-        complete = True
-        discounted = False
-        for record in (item for item in records if item["model"] == model):
-            item_cost, item_discounted = estimate_record_cost(record, prices)
-            if item_cost is None:
-                complete = False
-                break
-            cost += item_cost
-            discounted = discounted or item_discounted
-        bucket["estimated_cost_usd"] = float(cost) if complete else None
-        if complete:
-            estimated_total += cost
-            priced_models += 1
-            cache_discount_models += int(discounted)
-    output = {
-        "source": "local Codex rollout token counters",
-        "period_days": days,
+        model_bucket = totals.setdefault(record["model"], bucket())
+        cost = record["reported_cost_usd"]
+        cost_kind = "reported" if cost is not None else "estimated"
+        if cost is None:
+            cost, _ = estimate_record_cost(record, prices)
+        for target in (model_bucket, summary):
+            target["records"] += 1
+            target["desktop_requests" if record["source"] == "desktop" else "legacy_records"] += 1
+            for key in USAGE_COUNTERS:
+                target[key] += record[key]
+            if cost is None:
+                target["unpriced_records"] += 1
+            else:
+                target[cost_kind + "_records"] += 1
+                target[cost_kind + "_cost_usd"] += cost
+
+    for target in [summary, *totals.values()]:
+        known = target["reported_cost_usd"] + target["estimated_cost_usd"]
+        target["known_cost_usd"] = float(known)
+        target["total_cost_usd"] = None if target["unpriced_records"] else float(known)
+        target["cost_source"] = ("partial" if target["unpriced_records"] else
+                                 "mixed" if target["reported_records"] and target["estimated_records"] else
+                                 "estimated" if target["estimated_records"] else
+                                 "reported" if target["reported_records"] else "none")
+        target["reported_cost_usd"] = float(target["reported_cost_usd"])
+        target["estimated_cost_usd"] = float(target["estimated_cost_usd"])
+    for model, target in totals.items():
+        metadata = prices.get(model) or {}
+        target["display_name"] = selector_name(names.get(model) or metadata.get("name") or model.split("/", 1)[-1])
+    if summary["unpriced_records"]:
+        warnings.append(f"Cost unavailable for {summary['unpriced_records']} records; known cost is a partial subtotal.")
+    data_complete = ledger_status != "unreadable" and not invalid and not unreadable
+    if not data_complete:
+        summary["total_cost_usd"] = None
+        summary["cost_source"] = "partial"
+    return {
+        "schema_version": 2, "source": "shared-router ledger and legacy OpenRouter CLI rollouts",
+        "scope": "OpenRouter only; native ChatGPT and Ollama usage is excluded.",
+        "period_days": days, "generated_at": datetime.now(timezone.utc).isoformat(),
+        "ledger_status": ledger_status, "invalid_ledger_records": invalid, "warnings": warnings,
+        "data_complete": data_complete,
         "records": len(records), "unreadable_files": unreadable,
         "pricing_catalog_fetched_at": fetched,
-        "estimated_total_usd": float(estimated_total) if priced_models == len(totals) else None,
-        "models": totals,
+        "total_tokens": summary["total_tokens"], "total_cost_usd": summary["total_cost_usd"],
+        "reported_total_usd": summary["reported_cost_usd"], "estimated_total_usd": summary["estimated_cost_usd"],
+        "summary": summary, "models": totals,
     }
+
+
+def usage(days: int, as_json: bool, offline: bool, refresh_prices: bool = False) -> None:
+    if offline and refresh_prices:
+        raise SetupError("Choose either --offline or --refresh-prices.")
+    output = build_usage_report(days, offline, refresh_prices)
     if as_json:
         print(json.dumps(output, indent=2, sort_keys=True))
         return
     UI.section("BCU local usage")
     UI.row("WINDOW", "all retained history" if days == 0 else f"last {days} days")
-    UI.row("SOURCE", "Exact tokens from local Codex OpenRouter sessions", "mint")
-    if not totals:
+    UI.row("SOURCE", "Shared desktop ledger + legacy OpenRouter CLI sessions", "mint")
+    for warning in output["warnings"]:
+        UI.row("NOTICE", warning, "amber")
+    if not output["models"]:
         UI.row("RESULT", "No locally recorded OpenRouter token usage found.", "amber")
         return
-    for model, bucket in sorted(totals.items(), key=lambda item: item[1]["total_tokens"], reverse=True):
+    for model, bucket in sorted(output["models"].items(), key=lambda item: item[1]["total_tokens"], reverse=True):
         UI.section(model)
-        UI.row("TURNS", f"{bucket['turns']:,}")
+        UI.row("RECORDS", f"{bucket['desktop_requests']:,} desktop requests · {bucket['legacy_records']:,} legacy records")
         UI.row("INPUT", f"{bucket['input_tokens']:,} ({bucket['cached_input_tokens']:,} cached)")
         UI.row("CACHE WRITE", f"{bucket['cache_write_input_tokens']:,}")
-        UI.row("OUTPUT", f"{bucket['output_tokens']:,} (+ {bucket['reasoning_output_tokens']:,} reasoning)")
+        UI.row("OUTPUT", f"{bucket['output_tokens']:,} (includes {bucket['reasoning_output_tokens']:,} reasoning)")
         UI.row("TOTAL", f"{bucket['total_tokens']:,}", "mint")
-        estimate = bucket["estimated_cost_usd"]
-        UI.row("EST. COST", f"${estimate:,.6f}" if estimate is not None else "unavailable for current catalog", "amber")
-    grand_tokens = sum(bucket["total_tokens"] for bucket in totals.values())
+        UI.row("COST", f"${bucket['known_cost_usd']:,.6f} · {bucket['cost_source']}", "amber")
     UI.section("Total")
-    UI.row("TOKENS", f"{grand_tokens:,}", "mint")
-    UI.row("EST. COST", f"${estimated_total:,.6f}" if priced_models == len(totals) else "partial/unavailable", "amber")
-    UI.row("PRICING AS OF", fetched)
-    UI.row("IMPORTANT", "Cost is a back-estimate using current base catalog prices, not an invoice.", "amber")
-    UI.row("CACHE", "Cached tokens use catalog cache-read price when advertised; otherwise prompt price.")
-    if unreadable:
-        UI.row("SKIPPED", f"{unreadable} unreadable rollout files", "amber")
+    summary = output["summary"]
+    UI.row("TOKENS", f"{summary['total_tokens']:,}", "mint")
+    UI.row("REPORTED COST", f"${summary['reported_cost_usd']:,.6f} · {summary['reported_records']:,} records")
+    UI.row("ESTIMATED COST", f"${summary['estimated_cost_usd']:,.6f} · {summary['estimated_records']:,} records", "amber")
+    UI.row("KNOWN COST", f"${summary['known_cost_usd']:,.6f} · {summary['cost_source']}", "mint")
+    UI.row("PRICING AS OF", output["pricing_catalog_fetched_at"])
+    UI.row("SCOPE", output["scope"])
+    UI.row("COST NOTE", "Reported response costs take priority; missing costs use catalog estimates, not historical invoices.")
 
 
 def launch(arguments: list[str]) -> None:
@@ -1837,6 +1965,7 @@ def menu_install() -> None:
                           capture_output=True, check=False).returncode:
             raise SetupError("Could not package the BCU application icon.")
         info = {"CFBundleIdentifier": identifier, "CFBundleName": "Bobo Codex Ultra",
+                "BCUPythonExecutable": str(Path(sys.executable).resolve()),
                 "CFBundleDisplayName": "Bobo Codex Ultra", "CFBundleExecutable": "BCU Menu",
                 "CFBundlePackageType": "APPL", "CFBundleVersion": "1", "CFBundleShortVersionString": "1.0",
                 "CFBundleIconFile": "AppIcon", "LSUIElement": True, "NSHighResolutionCapable": True,
@@ -1913,6 +2042,15 @@ def docs(topic: str) -> None:
             ("automatic retry", "Up to six attempts within a 180-second wait budget for temporary 429/503 rejections; no replay after streaming starts."),
             ("configuration", "Optional $CODEX_HOME/bcu/traffic.json overrides; see docs/TRAFFIC.md. Run on when tasks are idle to reload."),
         ],
+        "usage": [
+            ("usage", "Last 30 days of shared desktop requests plus legacy OpenRouter CLI records, grouped by model."),
+            ("usage --days 7 / usage --days 0", "Choose a lookback window; 0 includes all retained local history."),
+            ("usage --offline", "Read local counters and cached prices without a network request or API key."),
+            ("usage --refresh-prices", "Refresh OpenRouter's public pricing catalog for records without reported costs."),
+            ("usage --json", "Schema v2: token counters, reported and estimated costs, source counts and completeness warnings."),
+            ("menu: Usage & Costs", "Graphical date filters, search, sorting and per-model costs; refreshes locally every 15 seconds while visible."),
+            ("cost accuracy", "Reported costs take priority. Estimates use current catalog prices, not historical billing. Unknown prices remain marked partial."),
+        ],
         "setup": [
             ("setup --check", "Read-only macOS, Python, Codex CLI and config preflight; safe in scripts."),
             ("setup", "Interactive terminal wizard: install CLI, choose models, secure Keychain prompt, enable desktop, optional agents."),
@@ -1948,10 +2086,10 @@ def docs(topic: str) -> None:
         UI.row("doctor", "Diagnose desktop routing without making a model call.")
         UI.row("menu", "Control BCU from the macOS menu bar; opens or installs the companion app.")
         UI.row("status", "Check key, profile, catalog, desktop mode, and lineup.")
-        UI.row("usage", "Exact locally recorded BCU tokens plus current-price cost estimates.")
+        UI.row("usage", "Desktop and legacy OpenRouter tokens, reported costs and clearly marked estimates.")
         UI.row("snake / pong / doom", "Play offline terminal arcade games; `docs games` shows controls.")
         UI.row("reset", "Alias for off.")
-        UI.row("docs [topic]", "Read these built-in docs; topics: setup, auth, model, agents, desktop, codex, games.")
+        UI.row("docs [topic]", "Read these built-in docs; topics: setup, auth, model, agents, desktop, codex, traffic, usage, games.")
         UI.row("install", "Update both names in ~/.local/bin from this executable.")
         UI.row("ALIAS", "boboultracodex works identically to bobocodexultra.", "pink")
     UI.section("Safety")
@@ -1998,10 +2136,11 @@ def main() -> None:
     traffic_parser.add_argument("--json", action="store_true", help="Emit a machine-readable scheduler snapshot")
     menu_parser = sub.add_parser("menu", help="Open or install the native macOS menu bar app")
     menu_parser.add_argument("action", nargs="?", choices=("open", "install"), default="open")
-    usage_parser = sub.add_parser("usage", help="Report locally recorded BCU tokens and estimated cost")
+    usage_parser = sub.add_parser("usage", help="Report desktop/CLI OpenRouter tokens, reported costs and estimates")
     usage_parser.add_argument("--days", type=int, default=30, help="Lookback days; 0 means all retained history")
     usage_parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     usage_parser.add_argument("--offline", action="store_true", help="Use cached pricing without contacting OpenRouter")
+    usage_parser.add_argument("--refresh-prices", action="store_true", help="Refresh the public pricing catalog, bypassing its one-hour cache")
     sub.add_parser("reset", help="Alias for off: restore the previous desktop setup")
     sub.add_parser("install", help="Install both command names in ~/.local/bin")
     reasoning_parser = sub.add_parser("reasoning", help="Show or set per-model BCU reasoning difficulty")
@@ -2017,7 +2156,7 @@ def main() -> None:
     for game in ("snake", "pong", "doom"):
         sub.add_parser(game, help=f"Play {game.capitalize()} offline in the terminal")
     docs_parser = sub.add_parser("docs", help="Read built-in command documentation")
-    docs_parser.add_argument("topic", nargs="?", choices=("setup", "auth", "model", "agents", "desktop", "codex", "traffic", "games"), default="all")
+    docs_parser.add_argument("topic", nargs="?", choices=("setup", "auth", "model", "agents", "desktop", "codex", "traffic", "usage", "games"), default="all")
     desktop_sub = sub.add_parser("desktop", help="Control shared desktop routing (shortcuts: on / off)").add_subparsers(dest="action", required=True)
     desktop_sub.add_parser("on", help="Enable ChatGPT, Ollama and BCU models side by side")
     desktop_sub.add_parser("off", help="Restore the previous native/Ollama desktop configuration")
@@ -2079,7 +2218,7 @@ def main() -> None:
         elif args.command == "menu":
             menu_install() if args.action == "install" else menu_open()
         elif args.command == "usage":
-            usage(args.days, args.json, args.offline)
+            usage(args.days, args.json, args.offline, args.refresh_prices)
         elif args.command == "reset":
             mixed_off()
         elif args.command == "install":

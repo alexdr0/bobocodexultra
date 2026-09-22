@@ -44,4 +44,8 @@ If the task contains provider-specific compacted or encrypted reasoning history,
 
 ## `usage` does not include desktop requests
 
-The router stores response token counters and reported cost in `$CODEX_HOME/bcu/usage.sqlite3`. The current `bobocodexultra usage` command covers the older dedicated OpenRouter CLI profile, not the shared desktop router's ledger. Do not treat a current-price estimate as a billing statement.
+Older releases read only the dedicated OpenRouter CLI profile and missed shared desktop requests. Update/install the CLI, then run `bobocodexultra usage --offline --days 0`. The command now reads the existing `$CODEX_HOME/bcu/usage.sqlite3` ledger alongside legacy CLI records; previously recorded desktop history is retained. Use `--days 0` to include records older than the default 30-day window. Native ChatGPT/Ollama calls are intentionally excluded.
+
+For the graphical view, quit the old menu companion, run `bobocodexultra menu install`, then choose **Usage & Costs…**. The installer pins the Python interpreter used to build the app so a Finder/login launch does not depend on your shell's PATH. Reinstall if that interpreter moves. No router or Codex restart is needed for reporting changes.
+
+An unreadable ledger produces a warning and a partial report, not a false zero total. Missing prices produce a known-cost subtotal; `usage --refresh-prices` refreshes fallback public pricing without reading your API key. Retired model IDs may still have no price. Do not delete the ledger to repair a report; it contains your retained desktop history. See [Usage accounting](USAGE.md).
