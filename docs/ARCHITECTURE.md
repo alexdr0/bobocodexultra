@@ -18,6 +18,8 @@ For native models, BCU forwards the request body and original authentication to 
 
 The service binds loopback and is managed by a per-user LaunchAgent. `on` writes a backup of the original config, prepares the combined catalog, starts a healthy router, then updates the config. `off` restores the original provider, base URL and catalog, retaining unrelated later settings; a second recovery backup is saved. The listener remains available for tasks that still have the old endpoint until those tasks reload.
 
+Retry and quota response headers pass through on both native and OpenRouter errors, leaving retries to the client. The health endpoint and `doctor` expose bounded, in-memory error metadata (route, model, status, time, and parsed retry delay), never upstream error bodies or credentials. Request counters include unsuccessful upstream responses; all diagnostics reset on service restart.
+
 ## Compatibility limits
 
 OpenRouter's Responses API is stateless, so BCU sends full visible history with `store=false`; a native `previous_response_id` cannot be resumed there. Provider-encrypted reasoning cannot be transferred, and opaque native compaction state cannot be converted to OpenRouter. Start a new Codex task with a visible summary when changing providers after compaction. OpenRouter does not provide Codex's native `/responses/compact` route. Unsupported tool types are rejected rather than silently dropped.

@@ -226,6 +226,15 @@ def doctor() -> None:
             UI.row("GUI THINKING", "low / medium / high advertised for all selected BCU models", "mint")
     if runtime:
         UI.row("REQUESTS", json.dumps(runtime.get("counts", {})))
+        for event in runtime.get("recent_errors", [])[-5:]:
+            when = time.strftime("%H:%M:%S", time.localtime(event["timestamp"]))
+            retry = event.get("retry_after_seconds")
+            hint = f" · retry hint at failure: {retry}s" if retry is not None else ""
+            UI.row("UPSTREAM ERROR", f"{when} · {safe_text(event['route'])} · {safe_text(event['model'])} · "
+                   f"HTTP {event['status']}{hint}", "amber")
+        if runtime.get("counts", {}).get("rate_limits"):
+            UI.row("RATE LIMITS", "Wait for the upstream retry window; reduce simultaneous tasks/subagents. "
+                   "For OpenRouter models, also check that provider's limits. Counts reset when the router restarts.", "amber")
     UI.row("RECOVERY", "`bobocodexultra on` repairs a stopped service; `off` restores native desktop settings.")
 
 

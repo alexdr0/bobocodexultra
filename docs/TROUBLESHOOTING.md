@@ -18,6 +18,16 @@ BCU requires Python 3.14+, the macOS desktop login session, and a free local por
 
 Use `bobocodexultra auth status` to check Keychain presence without printing the key. Verify model access and account balance directly in OpenRouter. A selected model may lack full Responses API, tool, or subagent compatibility even when OpenRouter lists it as tool-capable. Start with a short task. An upstream 429 is a rate limit, not evidence that the local router selected the wrong provider.
 
+## “Exceeded retry limit” / HTTP 429
+
+The provider rejected requests until Codex exhausted its retry attempts. OpenRouter limits are separate from your native ChatGPT allowance. Reduce simultaneous tasks/subagents, wait for the provider's retry window, or select another model. Persistent failures need a check of the model provider's rate limits and your OpenRouter account limits; adding credits is not a universal fix for 429s.
+
+BCU forwards `Retry-After` and quota headers on OpenRouter error responses. Older builds discarded those headers, which could cause the client to retry too soon. Update/install BCU, then run `bobocodexultra on` when active tasks have finished to load the updated router. No Codex restart is needed for this router-only fix.
+
+Run `bobocodexultra doctor` after a failure. It shows the recent upstream route, model, HTTP status, and retry delay reported at the time of failure. These are in-memory diagnostics, reset on router restart; they contain no prompt text, credentials, or upstream error bodies. A `native` route can include an existing Ollama router. BCU does not add another automatic retry loop, change your model, or bypass provider limits. HTTP 402 requires checking credit/spending limits; honor `Retry-After` if OpenRouter supplies it for a temporary in-flight budget limit.
+
+See [OpenRouter error and retry guidance](https://openrouter.ai/docs/api/reference/errors-and-debugging) and [OpenAI Docs rate-limit guidance](https://developers.openai.com/api/docs/guides/rate-limits/).
+
 ## Reasoning choice does not seem to take effect
 
 Run `bobocodexultra reasoning` to inspect each selected BCU model's default, then change one with `bobocodexultra reasoning medium --model author/model-id` and relaunch Codex. `bobocodexultra doctor` shows whether a user-level `model_reasoning_effort` may override the catalog default. Explicit task or custom-agent settings can also win. The BCU OpenRouter route caps `xhigh`, `max`, and `ultra` requests at `high`; this does not affect native/Ollama requests. If a provider rejects a lower effort, try another selected model or return that model to `high`.

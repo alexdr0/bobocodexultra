@@ -32,6 +32,17 @@ class Upstream(BaseHTTPRequestHandler):
         decoded = zstd.decompress(raw) if self.headers.get("Content-Encoding") == "zstd" else raw
         body = json.loads(decoded)
         self.server.requests.append((self.path, dict(self.headers), body, raw))
+        if failure := getattr(self.server, "failure", None):
+            status, headers, encoded = failure
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(encoded)))
+            self.send_header("Connection", "close")
+            self.close_connection = True
+            for name, value in headers.items():
+                self.send_header(name, value)
+            self.end_headers()
+            self.wfile.write(encoded)
+            return
         result = {"id": "resp-" + str(time.time_ns()), "object": "response", "status": "completed",
                   "output": [], "usage": {"input_tokens": 10, "output_tokens": 3, "total_tokens": 13,
                                           "input_tokens_details": {"cached_tokens": 2}}}
@@ -76,7 +87,7 @@ class RouterTests(unittest.TestCase):
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
 
-    def request(self, model="author/model", payload=None, headers=None, path="/v1/responses", raw=None):
+    def request(self, model="author/model", payload=None, headers=None, path="/v1/responses", raw=None, with_headers=False):
         c = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
         body = raw or json.dumps(payload or {"model": model, "input": "test"}).encode()
         h = {"Content-Type": "application/json", "Authorization": "Bearer native-secret",
@@ -85,8 +96,55 @@ class RouterTests(unittest.TestCase):
         c.request("POST", path, body, h)
         r = c.getresponse()
         result = r.status, r.read()
+        if with_headers:
+            result += (dict(r.getheaders()),)
         c.close()
         return result
+
+    def test_openrouter_429_preserves_retry_hint_and_reports_safe_diagnostics(self):
+        private_body = b'{"error":{"message":"private upstream text","metadata":{"raw":"private details"}}}'
+        self.upstream.failure = (429, {"Retry-After": "60", "X-RateLimit-Remaining": "0",
+                                      "Set-Cookie": "private-cookie", "Content-Encoding": "gzip"}, private_body)
+        status, body, headers = self.request(with_headers=True)
+        self.assertEqual(status, 429)
+        self.assertEqual(headers["retry-after"], "60")
+        self.assertEqual(headers["x-ratelimit-remaining"], "0")
+        self.assertNotIn("Set-Cookie", headers)
+        self.assertNotIn("Content-Encoding", headers)  # BCU generated an uncompressed error body.
+        error = json.loads(body)["error"]
+        self.assertEqual(error["code"], "rate_limit_exceeded")
+        self.assertIn("OpenRouter", error["message"])
+        self.assertNotIn(b"private", body)
+        self.assertEqual(len(self.upstream.requests), 1)  # No nested retry loop.
+        snapshot = bcu.health(self.server.server_port)
+        self.assertEqual(snapshot["counts"]["openrouter"], 1)
+        self.assertEqual(snapshot["counts"]["rate_limits"], 1)
+        self.assertEqual(snapshot["counts"]["errors"], 1)
+        event = snapshot["recent_errors"][-1]
+        self.assertEqual((event["route"], event["model"], event["status"], event["retry_after_seconds"]),
+                         ("openrouter", "author/model", 429, 60))
+        self.assertNotIn("private", json.dumps(snapshot))
+        with closing(sqlite3.connect(self.home / "usage.sqlite3")) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM usage").fetchone()[0], 0)
+
+    def test_upstream_errors_keep_status_and_do_not_invent_retry_hints(self):
+        for status, hint in ((503, "30"), (402, None), (402, "10"), (429, None),
+                             (429, "Fri, 01 Jan 2100 00:00:00 GMT")):
+            with self.subTest(status=status, hint=hint):
+                self.upstream.failure = (status, {"Retry-After": hint} if hint else {}, b"{}")
+                result, _, headers = self.request(with_headers=True)
+                self.assertEqual(result, status)
+                self.assertEqual(headers.get("retry-after"), hint)
+        self.assertEqual(len(self.upstream.requests), 5)
+
+    def test_native_error_body_and_retry_headers_are_preserved(self):
+        body = b'{"error":{"message":"native quota","code":"usage_limit_reached"}}'
+        self.upstream.failure = (429, {"Content-Type": "application/json", "Retry-After": "45"}, body)
+        status, received, headers = self.request(model="gpt-native", with_headers=True)
+        self.assertEqual((status, received, headers["retry-after"]), (429, body, "45"))
+        event = bcu.health(self.server.server_port)["recent_errors"][-1]
+        self.assertEqual((event["route"], event["model"]), ("native", "gpt-native"))
+        self.assertNotIn("native quota", json.dumps(event))
 
     def test_native_and_ollama_preserve_auth_body_and_endpoint(self):
         for model in ("gpt-native", "ollama:cloud"):
@@ -208,6 +266,16 @@ class RouterTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_retry_hint_parsing_and_metadata_filtering(self):
+        for value in (None, "bad", "nan", "inf", "1e1000", "x" * 129):
+            self.assertIsNone(bcu.retry_after_seconds(value))
+        self.assertEqual(bcu.retry_after_seconds("1.5"), 2)
+        with patch.object(bcu.time, "time", return_value=0):
+            self.assertEqual(bcu.retry_after_seconds("Thu, 01 Jan 1970 00:01:00 GMT"), 60)
+        response = unittest.mock.Mock()
+        response.getheaders.return_value = [("Retry-After", "5\r\nInjected: true"), ("Set-Cookie", "private")]
+        self.assertEqual(bcu.response_metadata(response), {})
+
     def test_selected_reasoning_passes_through_and_excess_is_capped(self):
         for effort in ("low", "medium", "high"):
             payload, _ = bcu.normalize({"model": "author/model", "input": "test",

@@ -5,13 +5,16 @@ Python 3.14+ on macOS. No third-party dependencies. No prompt/header logging.
 from __future__ import annotations
 
 import copy
+from collections import deque
 from compression import zstd
 from contextlib import contextmanager, closing
+from email.utils import parsedate_to_datetime
 import fcntl
 import hashlib
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
 import os
 from pathlib import Path
 import plistlib
@@ -34,6 +37,31 @@ ACCOUNT = "openrouter-api-key"
 HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
        "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length"}
 BUILD_ID = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
+
+
+def retry_after_seconds(value: str | None) -> int | None:
+    """Interpret server hints for diagnostics without retaining raw headers."""
+    if not value or len(value) > 128:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            seconds = parsedate_to_datetime(value).timestamp() - time.time()
+        except (ValueError, TypeError, OverflowError):
+            return None
+    return max(0, math.ceil(seconds)) if math.isfinite(seconds) else None
+
+
+def response_metadata(response) -> dict[str, str]:
+    """Pass retry/quota hints on successes AND errors; exclude arbitrary headers."""
+    result = {}
+    for name, value in response.getheaders():
+        key = name.lower()
+        if (key.startswith(("x-ratelimit-", "x-codex-")) or key in ("retry-after", "x-request-id")):
+            if len(value) <= 1024 and "\r" not in value and "\n" not in value:
+                result[key] = value
+    return result
 
 
 def write(path: Path, data: bytes) -> None:
@@ -467,10 +495,22 @@ class RouterServer(ThreadingHTTPServer):
         self.key_reader = key_reader
         self.openrouter_base = openrouter_base
         self.ledger = Ledger(routes.parent / "usage.sqlite3")
-        self.counts = {"native": 0, "openrouter": 0, "errors": 0, "usage_errors": 0}
+        self.counts = {"native": 0, "openrouter": 0, "errors": 0, "usage_errors": 0, "rate_limits": 0}
+        self.recent_errors = deque(maxlen=8)
         self.count_lock = threading.Lock()
         self.slots = threading.BoundedSemaphore(32)
         super().__init__(address, Handler)
+
+    def record_status(self, route, model, status, retry_after):
+        # No error bodies, prompt text, credentials, or raw response headers.
+        with self.count_lock:
+            self.counts[route] += 1
+            if status >= 400:
+                self.counts["errors"] += 1
+                self.counts["rate_limits"] += int(status == 429)
+                self.recent_errors.append({"timestamp": time.time(), "route": route,
+                                           "model": model, "status": status,
+                                           "retry_after_seconds": retry_after_seconds(retry_after)})
 
     def handle_error(self, request, client_address):
         # Never write tracebacks containing provider payloads or credentials.
@@ -496,12 +536,17 @@ class Handler(BaseHTTPRequestHandler):
         self.connection.settimeout(120)
         self.started = False
 
-    def error(self, status, message):
-        body = json.dumps({"error": {"message": message, "type": "bcu_router_error"}}).encode()
+    def error(self, status, message, *, metadata=None, error_type="bcu_router_error", code=None):
+        error = {"message": message, "type": error_type}
+        if code:
+            error["code"] = code
+        body = json.dumps({"error": error}).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
+        for name, value in (metadata or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(body)
         self.close_connection = True
@@ -518,8 +563,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         if self.path == "/_bcu/health":
             routes = read_json(self.server.routes)
+            with self.server.count_lock:
+                counts = dict(self.server.counts)
+                recent_errors = list(self.server.recent_errors)
             body = json.dumps({"service": "bcu", "version": 1, "build": BUILD_ID, "home": routes["home"],
-                               "counts": self.server.counts, "models": len(routes["bcu_models"])}).encode()
+                               "counts": counts, "recent_errors": recent_errors,
+                               "models": len(routes["bcu_models"])}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -603,22 +652,37 @@ class Handler(BaseHTTPRequestHandler):
             path = target.path.rstrip("/") + self.path.removeprefix("/v1")
             upstream.request("POST", path, body, headers)
             response = upstream.getresponse()
+            metadata = response_metadata(response)
+            self.server.record_status("openrouter" if is_bcu else "native", model,
+                                      response.status, metadata.get("retry-after"))
             if is_bcu and not 200 <= response.status < 300:
+                error_type, code = "bcu_upstream_error", None
+                if response.status == 429:
+                    error_type, code = "rate_limit_error", "rate_limit_exceeded"
+                    message = (f"OpenRouter rate-limited {model} (HTTP 429). Honor Retry-After when provided; "
+                               "reduce parallel tasks/subagents or choose another model. "
+                               "Check bobocodexultra doctor for recent errors.")
+                elif response.status == 402:
+                    message = ("OpenRouter returned HTTP 402. Check your OpenRouter credit/spending limit. "
+                               "If Retry-After is present, wait before retrying; otherwise review billing.")
+                elif response.status == 503:
+                    message = "OpenRouter is temporarily unavailable (HTTP 503). Honor Retry-After before retrying."
+                else:
+                    message = f"OpenRouter returned HTTP {response.status}. Check model access, credit, and API compatibility."
                 self.error(response.status if response.status >= 400 else 502,
-                           f"OpenRouter returned HTTP {response.status}. Check model access, credit, and API compatibility.")
+                           message, metadata=metadata, error_type=error_type, code=code)
                 return
             self.send_response(response.status)
             self.send_header("Content-Type", response.getheader("Content-Type", "application/json"))
             # Forward native quota/request metadata without cookies or redirects.
-            for k, v in response.getheaders():
-                if k.lower().startswith(("x-ratelimit-", "x-codex-")) or k.lower() in ("retry-after", "x-request-id", "content-encoding"):
-                    self.send_header(k, v)
+            for k, v in metadata.items():
+                self.send_header(k, v)
+            if response.getheader("Content-Encoding"):
+                self.send_header("Content-Encoding", response.getheader("Content-Encoding"))
             self.send_header("Connection", "close")
             self.end_headers()
             self.started = True
             self.close_connection = True
-            with self.server.count_lock:
-                self.server.counts["openrouter" if is_bcu else "native"] += 1
             if not is_bcu:
                 while chunk := response.read1(65536):
                     self.wfile.write(chunk)

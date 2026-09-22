@@ -138,6 +138,23 @@ class OpenRouterCodexTests(unittest.TestCase):
             tool["doctor"]()
         self.assertIn("model sync", next(args[1] for args in recorded if args[0] == "GUI THINKING"))
 
+    def test_doctor_reports_rate_limit_route_model_and_retry_hint(self):
+        controller = SimpleNamespace(state=self.home / "absent-state.json", catalog=self.home / "absent-catalog.json")
+        runtime = {"home": str(self.home), "counts": {"rate_limits": 1}, "recent_errors": [
+            {"timestamp": 0, "route": "openrouter", "model": "author/model", "status": 429,
+             "retry_after_seconds": 60}]}
+        recorded = []
+        with patch.dict(tool["doctor"].__globals__, {
+            "mixed_controller": lambda: controller,
+            "router_module": lambda: SimpleNamespace(health=lambda: runtime),
+            "key_exists": lambda: False,
+        }), patch.object(tool["UI"], "row", side_effect=lambda *args, **kwargs: recorded.append(args)):
+            tool["doctor"]()
+        message = next(args[1] for args in recorded if args[0] == "UPSTREAM ERROR")
+        for expected in ("openrouter", "author/model", "HTTP 429", "60s"):
+            self.assertIn(expected, message)
+        self.assertTrue(any(args[0] == "RATE LIMITS" for args in recorded))
+
     def test_label_sync_preserves_unrelated_desktop_edit(self):
         (self.home / "config.toml").write_text('model = "gpt-6-astra"\nservice_tier = "default"\n')
         with patch.dict(tool["prepare"].__globals__, {"ensure_macos": lambda: None, "key_exists": lambda: True}):
