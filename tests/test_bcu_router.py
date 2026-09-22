@@ -7,6 +7,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sqlite3
+import socket
 import sys
 import tempfile
 import threading
@@ -32,7 +33,16 @@ class Upstream(BaseHTTPRequestHandler):
         decoded = zstd.decompress(raw) if self.headers.get("Content-Encoding") == "zstd" else raw
         body = json.loads(decoded)
         self.server.requests.append((self.path, dict(self.headers), body, raw))
-        if failure := getattr(self.server, "failure", None):
+        if getattr(self.server, "drop_connection", False):
+            self.close_connection = True
+            self.connection.shutdown(socket.SHUT_RDWR)
+            return
+        if before := getattr(self.server, "before_response", None):
+            before(body)
+        failure = getattr(self.server, "failure", None)
+        if callable(failure):
+            failure = failure(body)
+        if failure:
             status, headers, encoded = failure
             self.send_response(status)
             self.send_header("Content-Length", str(len(encoded)))
@@ -51,8 +61,9 @@ class Upstream(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Connection", "close")
             self.end_headers()
-            events = [{"type": "response.output_text.delta", "delta": "hello"},
-                      {"type": "response.completed", "response": result}]
+            events = getattr(self.server, "events", None) or [
+                {"type": "response.output_text.delta", "delta": "hello"},
+                {"type": "response.completed", "response": result}]
             for event in events:
                 self.wfile.write(("data: " + json.dumps(event) + "\n\n").encode())
                 self.wfile.flush()
@@ -66,12 +77,18 @@ class Upstream(BaseHTTPRequestHandler):
             self.wfile.write(encoded)
 
 
+class TestUpstreamServer(ThreadingHTTPServer):
+    request_queue_size = 128
+
+
 class RouterTests(unittest.TestCase):
+    traffic_options = {"max_attempts": 1}
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name)
-        self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+        self.upstream = TestUpstreamServer(("127.0.0.1", 0), Upstream)
         self.upstream.requests = []
         threading.Thread(target=self.upstream.serve_forever, daemon=True).start()
         self.addCleanup(self.upstream.server_close)
@@ -82,7 +99,8 @@ class RouterTests(unittest.TestCase):
                        "native_models": ["gpt-native", "ollama:cloud"],
                        "bcu_models": ["author/model"], "known_bcu_models": ["author/model", "retired/model"]})
         self.server = bcu.RouterServer(("127.0.0.1", 0), self.routes,
-                                      key_reader=lambda: "test-openrouter-key", openrouter_base=base + "/router/v1")
+                                      key_reader=lambda: "test-openrouter-key", openrouter_base=base + "/router/v1",
+                                      traffic_options=self.traffic_options)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
@@ -115,7 +133,7 @@ class RouterTests(unittest.TestCase):
         self.assertEqual(error["code"], "rate_limit_exceeded")
         self.assertIn("OpenRouter", error["message"])
         self.assertNotIn(b"private", body)
-        self.assertEqual(len(self.upstream.requests), 1)  # No nested retry loop.
+        self.assertEqual(len(self.upstream.requests), 1)  # Single-attempt configuration.
         snapshot = bcu.health(self.server.server_port)
         self.assertEqual(snapshot["counts"]["openrouter"], 1)
         self.assertEqual(snapshot["counts"]["rate_limits"], 1)
@@ -131,6 +149,7 @@ class RouterTests(unittest.TestCase):
         for status, hint in ((503, "30"), (402, None), (402, "10"), (429, None),
                              (429, "Fri, 01 Jan 2100 00:00:00 GMT")):
             with self.subTest(status=status, hint=hint):
+                self.server.traffic = bcu.Traffic(bcu.traffic_settings(overrides=self.traffic_options))
                 self.upstream.failure = (status, {"Retry-After": hint} if hint else {}, b"{}")
                 result, _, headers = self.request(with_headers=True)
                 self.assertEqual(result, status)

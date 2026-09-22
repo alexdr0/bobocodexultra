@@ -1,5 +1,7 @@
 import json
 import argparse
+from contextlib import redirect_stdout
+import io
 import os
 import runpy
 import subprocess
@@ -39,6 +41,15 @@ class OpenRouterCodexTests(unittest.TestCase):
         self.assertEqual(config["model_providers"]["openrouter"]["auth"]["command"], "/usr/bin/security")
         self.assertNotIn("sk-or-", profile)
         self.assertTrue(all(m["base_instructions"] == tool["BASE_INSTRUCTIONS"] for m in catalog["models"]))
+
+    def test_traffic_json_command_has_no_banner_or_auth_access(self):
+        snapshot = {"active": {"native": 1, "openrouter": 2}, "queued": {"native": 0, "openrouter": 3}}
+        output = io.StringIO()
+        with patch.dict(tool["main"].__globals__, {
+            "router_module": lambda: SimpleNamespace(health=lambda: {"service": "bcu", "traffic": snapshot}),
+        }), patch.object(sys, "argv", ["bobocodexultra", "traffic", "--json"]), redirect_stdout(output):
+            tool["main"]()
+        self.assertEqual(json.loads(output.getvalue()), {"running": True, "traffic": snapshot})
 
     def test_desktop_round_trip_preserves_original_exactly(self):
         original = b'model = "gpt-6-astra"\nmodel_reasoning_effort = "xhigh"\n\n[desktop]\nappearance = "dark"\n'

@@ -113,6 +113,7 @@ bobocodexultra reasoning medium # Default effort for the selected default BCU mo
 bobocodexultra agents setup     # Set up Codex subagents with reversible defaults
 bobocodexultra off      # Restore the previous native/Ollama desktop setup
 bobocodexultra doctor   # Check the service, provider, endpoint and catalog
+bobocodexultra traffic  # Active requests, queues, cooldowns and automatic retries
 bobocodexultra sync     # Refresh the combined catalog
 bobocodexultra docs     # Full built-in command guide
 bobocodexultra snake    # Offline terminal Snake
@@ -127,6 +128,14 @@ Quit and reopen Codex after enabling/disabling shared mode or changing selected 
 The model TUI supports `/` search, `S` sort, arrows or J/K scrolling, Page Up/Down, Space multi-select, `D` default, `R` cycle low/medium/high reasoning, `I` details, Enter save, and Q cancel. Changes are staged until saved. Labels are exactly `[Model Name] (Openrouter)`, for example `Grok 4.6 (Openrouter)`. Provider prefixes are removed from labels; request model IDs remain unchanged.
 
 The one-time login is interactive and uses a hidden Keychain prompt. For machines already signed in with BCU, `bobocodexultra on` is enough to activate shared mode. `bobocodexultra login` can also replace the saved key. Use `bobocodexultra auth login --no-desktop` if you only want to update the key.
+
+## Multiple conversations and automatic recovery
+
+Shared desktop routing queues busy conversations and subagents automatically. Native/Ollama traffic has 16 active slots and OpenRouter has 8, with per-model limits of 8 and 2 respectively. Each route has room for 64 waiting requests. A cooling or busy model does not block eligible requests for other models.
+
+Temporary HTTP 429/503 rejections retry automatically, up to six upstream attempts within a 180-second queue/retry budget. BCU honors `Retry-After`; without a hint it uses exponential delays with jitter. All conversations using a model share its cooldown, followed by one recovery probe before normal parallelism resumes. Queued requests are discarded when their client disconnects. Billing/authentication failures, known exhausted quotas, ambiguous connection failures, and already-started streams are not automatically replayed.
+
+Inspect activity with `bobocodexultra traffic`, `traffic --json`, or `doctor`. Limits are configurable in an optional `bcu/traffic.json` file under your Codex home. Update/install BCU and run `bobocodexultra on` when tasks are idle to activate an updated router. See [Traffic control and retries](docs/TRAFFIC.md) for defaults, tuning, memory bounds, retry limits, and the dedicated CLI profile distinction. Persistent provider limits or a full local queue can still return an error; BCU cannot create provider capacity.
 
 ## Offline terminal arcade
 

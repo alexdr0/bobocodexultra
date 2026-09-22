@@ -18,7 +18,9 @@ For native models, BCU forwards the request body and original authentication to 
 
 The service binds loopback and is managed by a per-user LaunchAgent. `on` writes a backup of the original config, prepares the combined catalog, starts a healthy router, then updates the config. `off` restores the original provider, base URL and catalog, retaining unrelated later settings; a second recovery backup is saved. The listener remains available for tasks that still have the old endpoint until those tasks reload.
 
-Retry and quota response headers pass through on both native and OpenRouter errors, leaving retries to the client. The health endpoint and `doctor` expose bounded, in-memory error metadata (route, model, status, time, and parsed retry delay), never upstream error bodies or credentials. Request counters include unsuccessful upstream responses; all diagnostics reset on service restart.
+The threaded router uses separate native/OpenRouter queues and active limits, with additional limits per model. It chooses the oldest eligible waiter so a cooling or busy model does not hold up other models. Overload responses release their active slot and rejoin the queue after setting a shared model cooldown. Recovery starts with one probe; an older response cannot clear a newer cooldown. Retry and quota response headers pass through when retries are exhausted. No response is replayed once downstream streaming has started.
+
+The health endpoint, `traffic`, and `doctor` expose queue depths, active counts, retry totals, and bounded in-memory error metadata (route, model, status, time, and parsed retry delay), never upstream error bodies or credentials. Request counters count upstream attempts, including retries and unsuccessful responses. Diagnostics reset on service restart. See [Traffic control](TRAFFIC.md) for resource bounds and the exact retry policy.
 
 ## Compatibility limits
 

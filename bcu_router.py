@@ -18,7 +18,9 @@ import math
 import os
 from pathlib import Path
 import plistlib
+import random
 import re
+import select
 import socket
 import sqlite3
 import subprocess
@@ -37,6 +39,187 @@ ACCOUNT = "openrouter-api-key"
 HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
        "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length"}
 BUILD_ID = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
+TRAFFIC_DEFAULTS = {
+    "native_concurrency": 16, "openrouter_concurrency": 8,
+    "native_model_concurrency": 8, "openrouter_model_concurrency": 2,
+    "queue_limit": 64, "request_timeout": 180, "max_attempts": 6,
+    "backoff_base": 2, "backoff_max": 30, "jitter": 1, "body_budget_mb": 256,
+}
+
+
+def traffic_settings(path: Path | None = None, overrides=None):
+    supplied = read_json(path) if path and path.exists() else (overrides or {})
+    if not isinstance(supplied, dict) or set(supplied) - TRAFFIC_DEFAULTS.keys():
+        raise ValueError("Unknown traffic settings; see docs/TRAFFIC.md.")
+    settings = TRAFFIC_DEFAULTS | supplied
+    ranges = {"queue_limit": (1, 256), "request_timeout": (1, 600), "max_attempts": (1, 8),
+              "backoff_base": (0.01, 60), "backoff_max": (0.01, 120), "jitter": (0, 10),
+              "body_budget_mb": (1, 1024)}
+    for key, value in settings.items():
+        low, high = ranges.get(key, (1, 32))
+        integral = key not in ("request_timeout", "backoff_base", "backoff_max", "jitter")
+        if (type(value) not in (int, float) or not low <= value <= high
+                or (integral and type(value) is not int)):
+            raise ValueError(f"Invalid traffic setting: {key} (expected {'integer ' if integral else ''}{low}–{high}).")
+    if settings["backoff_max"] < settings["backoff_base"]:
+        raise ValueError("backoff_max must be at least backoff_base.")
+    return settings
+
+
+class TrafficBusy(Exception):
+    def __init__(self, message, retry_after=2):
+        super().__init__(message)
+        self.retry_after = max(1, math.ceil(retry_after))
+
+
+class ClientGone(Exception):
+    pass
+
+
+class Traffic:
+    """Bounded, work-conserving queues with separate provider capacity.
+
+    Cooldowns and recovery probes are shared by all tasks using the same model.
+    Never hold the condition lock while doing network, Keychain, or disk I/O.
+    """
+    def __init__(self, settings):
+        self.settings = settings
+        self.condition = threading.Condition()
+        self.waiting = {route: [] for route in ("native", "openrouter")}
+        self.active = dict.fromkeys(self.waiting, 0)
+        self.models = {}
+        self.cooldowns = {}
+        self.generation = 0
+        self.buffered = 0
+        self.metrics = dict.fromkeys(("queued_total", "retries", "recovered", "cancelled", "rejected", "queue_timeouts"), 0)
+
+    def note(self, metric):
+        with self.condition:
+            self.metrics[metric] += 1
+
+    def resize(self, previous, size):
+        with self.condition:
+            if self.buffered - previous + size > self.settings["body_budget_mb"] * 1024 * 1024:
+                self.metrics["rejected"] += 1
+                raise TrafficBusy("BCU's buffered request budget is full; retry shortly.")
+            self.buffered += size - previous
+        return size
+
+    def eligible(self, ticket, now):
+        route, model = ticket[1]
+        key = (route, model)
+        state = self.cooldowns.get(key)
+        limit = 1 if state else self.settings[f"{route}_model_concurrency"]
+        return (self.active[route] < self.settings[f"{route}_concurrency"]
+                and self.models.get(key, 0) < limit and (not state or state["until"] <= now))
+
+    def acquire(self, route, model, deadline, cancelled):
+        ticket = (object(), (route, model))
+        key = ticket[1]
+        with self.condition:
+            queue = self.waiting[route]
+            if len(queue) >= self.settings["queue_limit"]:
+                self.metrics["rejected"] += 1
+                raise TrafficBusy(f"BCU's {route} queue is full; retry shortly.")
+            queue.append(ticket)
+            waited = False
+            try:
+                while True:
+                    if cancelled():
+                        self.metrics["cancelled"] += 1
+                        raise ClientGone()
+                    now = time.monotonic()
+                    state = self.cooldowns.get(key, {})
+                    delay = max(0, state.get("until", now) - now)
+                    if now >= deadline or now + delay >= deadline:
+                        self.metrics["queue_timeouts"] += 1
+                        raise TrafficBusy("BCU's queue/retry wait budget was reached. The provider may still be overloaded.", delay)
+                    # Skip a cooling/saturated model, but preserve FIFO among
+                    # eligible requests. One hot model cannot block the rest.
+                    first = next((item for item in queue if self.eligible(item, now)), None)
+                    if first is ticket:
+                        self.active[route] += 1
+                        self.models[key] = self.models.get(key, 0) + 1
+                        return key, state.get("generation", 0)
+                    if not waited:
+                        self.metrics["queued_total"] += 1
+                        waited = True
+                    self.condition.wait(min(0.1, deadline - now))
+            finally:
+                queue.remove(ticket)
+                self.condition.notify_all()
+
+    def release(self, lease):
+        key, _ = lease
+        with self.condition:
+            self.active[key[0]] -= 1
+            self.models[key] -= 1
+            if not self.models[key]:
+                del self.models[key]
+            self.condition.notify_all()
+
+    def cooldown(self, lease, retry_after):
+        key, _ = lease
+        with self.condition:
+            previous = self.cooldowns.get(key, {})
+            failures = previous.get("failures", 0) + 1
+            fallback = min(self.settings["backoff_max"], self.settings["backoff_base"] * 2 ** min(failures - 1, 10))
+            delay = (retry_after if retry_after is not None else fallback) + random.uniform(0, self.settings["jitter"])
+            # A Retry-After hint is a minimum, even when longer than our budget.
+            until = max(previous.get("until", 0), time.monotonic() + delay)
+            self.generation += 1
+            self.cooldowns[key] = {"until": until, "failures": failures, "generation": self.generation}
+            self.condition.notify_all()
+            return until
+
+    def success(self, lease):
+        key, generation = lease
+        with self.condition:
+            state = self.cooldowns.get(key)
+            # A response already in flight before a 429 cannot clear its cooldown.
+            if state and state["generation"] == generation:
+                del self.cooldowns[key]
+                self.condition.notify_all()
+
+    def snapshot(self):
+        with self.condition:
+            queued_models = {}
+            for queue in self.waiting.values():
+                for _, key in queue:
+                    queued_models[key] = queued_models.get(key, 0) + 1
+            keys = sorted(set(self.models) | set(self.cooldowns) | set(queued_models))
+            now = time.monotonic()
+            details = [{"route": key[0], "model": key[1], "active": self.models.get(key, 0),
+                        "queued": queued_models.get(key, 0),
+                        "cooldown_seconds": max(0, math.ceil(self.cooldowns.get(key, {}).get("until", now) - now)),
+                        "recovering": key in self.cooldowns} for key in keys[:16]]
+            return {"settings": dict(self.settings), "active": dict(self.active),
+                    "queued": {route: len(queue) for route, queue in self.waiting.items()},
+                    "buffered_bytes": self.buffered, "metrics": dict(self.metrics), "models": details,
+                    "additional_models": max(0, len(keys) - 16)}
+
+
+def retryable_response(status, prefix, retry_after, content_encoding=None):
+    """Retry only explicit rejections, never an ambiguous transport failure."""
+    if content_encoding not in (None, "", "identity"):
+        return False  # Cannot safely classify an opaque error response.
+    try:
+        body = json.loads(prefix)
+        error = body.get("error", {})
+        if not isinstance(error, dict):
+            error = {}
+        codes = [error.get("code"), error.get("type"), body.get("error_type")]
+        metadata = error.get("metadata") or {}
+        if status == 402:
+            return (isinstance(metadata, dict) and metadata.get("limit_source") == "openrouter_in_flight_budget"
+                    and retry_after is not None)
+        permanent = {"insufficient_quota", "usage_limit_reached", "quota_exceeded", "billing_hard_limit_reached",
+                     "payment_required", "billing_error", "daily_limit_exceeded", "daily_quota_exceeded"}
+        if any(isinstance(code, str) and code in permanent for code in codes):
+            return False
+    except (ValueError, AttributeError, TypeError):
+        pass  # Some overloads have HTML or empty bodies rather than JSON.
+    return status in (429, 503)
 
 
 def retry_after_seconds(value: str | None) -> int | None:
@@ -45,6 +228,8 @@ def retry_after_seconds(value: str | None) -> int | None:
         return None
     try:
         seconds = float(value)
+        if seconds < 0:
+            return None
     except ValueError:
         try:
             seconds = parsedate_to_datetime(value).timestamp() - time.time()
@@ -185,6 +370,7 @@ class Controller:
                 write(path, encoded)
 
     def service_start(self) -> None:
+        settings = traffic_settings(self.directory / "traffic.json")
         running = health()
         if running:
             if running.get("home") != str(self.home):
@@ -203,7 +389,7 @@ class Controller:
         if self.plist.exists() and plistlib.loads(self.plist.read_bytes()).get("Label") != self.label:
             raise ValueError("An unrelated launch agent occupies BCU's service path.")
         write(self.plist, plistlib.dumps(payload))
-        if running.get("build") == BUILD_ID:
+        if running.get("build") == BUILD_ID and running.get("traffic", {}).get("settings") == settings:
             return
         domain = f"gui/{os.getuid()}"
         loaded = subprocess.run(["launchctl", "print", f"{domain}/{self.label}"], capture_output=True).returncode == 0
@@ -213,7 +399,8 @@ class Controller:
             raise ValueError("Could not start BCU's login service. Run this command from your macOS desktop session.")
         for _ in range(40):
             running = health()
-            if running.get("home") == str(self.home) and running.get("build") == BUILD_ID:
+            if (running.get("home") == str(self.home) and running.get("build") == BUILD_ID
+                    and running.get("traffic", {}).get("settings") == settings):
                 return
             time.sleep(0.15)
         raise ValueError("BCU service did not become healthy. Config was not activated; run BCU doctor.")
@@ -489,8 +676,10 @@ class Ledger:
 class RouterServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 128
 
-    def __init__(self, address, routes: Path, key_reader=keychain_key, openrouter_base="https://openrouter.ai/api/v1"):
+    def __init__(self, address, routes: Path, key_reader=keychain_key, openrouter_base="https://openrouter.ai/api/v1",
+                 traffic_options=None):
         self.routes = routes
         self.key_reader = key_reader
         self.openrouter_base = openrouter_base
@@ -498,7 +687,13 @@ class RouterServer(ThreadingHTTPServer):
         self.counts = {"native": 0, "openrouter": 0, "errors": 0, "usage_errors": 0, "rate_limits": 0}
         self.recent_errors = deque(maxlen=8)
         self.count_lock = threading.Lock()
-        self.slots = threading.BoundedSemaphore(32)
+        settings = (traffic_settings(overrides=traffic_options) if traffic_options is not None
+                    else traffic_settings(routes.parent / "traffic.json"))
+        self.traffic = Traffic(settings)
+        # Bound body readers plus admitted/queued requests. Route-specific
+        # queues enforce their own limits after the model has been decoded.
+        self.slots = threading.BoundedSemaphore(settings["queue_limit"] * 2
+                                               + settings["native_concurrency"] + settings["openrouter_concurrency"])
         super().__init__(address, Handler)
 
     def record_status(self, route, model, status, retry_after):
@@ -558,6 +753,16 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def cancelled(self):
+        """A queued request must disappear when its client closes the socket."""
+        try:
+            readable, _, _ = select.select([self.connection], [], [], 0)
+            return bool(readable) and self.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b""
+        except BlockingIOError:
+            return False
+        except (OSError, ValueError):
+            return True
+
     def do_GET(self):
         if not self.permitted():
             return
@@ -568,6 +773,7 @@ class Handler(BaseHTTPRequestHandler):
                 recent_errors = list(self.server.recent_errors)
             body = json.dumps({"service": "bcu", "version": 1, "build": BUILD_ID, "home": routes["home"],
                                "counts": counts, "recent_errors": recent_errors,
+                               "traffic": self.server.traffic.snapshot(),
                                "models": len(routes["bcu_models"])}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -586,15 +792,21 @@ class Handler(BaseHTTPRequestHandler):
             self.error(404, "Unknown BCU route.")
             return
         if not self.server.slots.acquire(blocking=False):
-            self.error(503, "BCU is handling its maximum concurrent requests; retry shortly.")
+            self.server.traffic.note("rejected")
+            self.error(503, "BCU's request queue is full; retry shortly.", metadata={"Retry-After": "2"})
             return
         upstream = None
+        lease = None
+        buffered = 0
+        traffic = self.server.traffic
+        deadline = time.monotonic() + traffic.settings["request_timeout"]
         try:
             if self.headers.get("Transfer-Encoding"):
                 raise ValueError("Chunked request bodies are unsupported; send Content-Length.")
             length = int(self.headers.get("Content-Length", "0"))
             if not 0 < length <= MAX_BODY:
                 raise ValueError("Request size is missing or exceeds 64 MiB.")
+            buffered = traffic.resize(buffered, length * 3)
             raw = self.rfile.read(length)
             if len(raw) != length:
                 raise ValueError("Incomplete request body.")
@@ -608,6 +820,7 @@ class Handler(BaseHTTPRequestHandler):
                 decoded = raw
             else:
                 raise ValueError("Unsupported request compression.")
+            buffered = traffic.resize(buffered, max(length, len(decoded)) * 3)
             payload = json.loads(decoded)
             if not isinstance(payload, dict) or not isinstance(payload.get("model"), str):
                 raise ValueError("A model ID is required.")
@@ -627,7 +840,7 @@ class Handler(BaseHTTPRequestHandler):
                 # An allowlist prevents ChatGPT/Ollama credentials, cookies, account
                 # identifiers and provider-specific headers reaching OpenRouter.
                 headers = {"Content-Type": "application/json", "Accept": "text/event-stream" if payload.get("stream") else "application/json",
-                           "Authorization": "Bearer " + self.server.key_reader(), "Accept-Encoding": "identity",
+                           "Accept-Encoding": "identity",
                            "User-Agent": "bobocodexultra/2"}
                 base = self.server.openrouter_base
             else:
@@ -646,20 +859,62 @@ class Handler(BaseHTTPRequestHandler):
                         headers = {k: v for k, v in headers.items() if k.lower() != "content-encoding"}
                 headers["Accept-Encoding"] = "identity"
                 base = routes.get("native_base") or ("https://chatgpt.com/backend-api/codex" if self.headers.get("ChatGPT-Account-ID") else "https://api.openai.com/v1")
+            buffered = traffic.resize(buffered, max(length, len(decoded), len(body)) * 3)
             target = urlsplit(base)
             connection_type = http.client.HTTPSConnection if target.scheme == "https" else http.client.HTTPConnection
-            upstream = connection_type(target.hostname, target.port, timeout=180)
             path = target.path.rstrip("/") + self.path.removeprefix("/v1")
-            upstream.request("POST", path, body, headers)
-            response = upstream.getresponse()
-            metadata = response_metadata(response)
-            self.server.record_status("openrouter" if is_bcu else "native", model,
-                                      response.status, metadata.get("retry-after"))
+            route = "openrouter" if is_bcu else "native"
+            for attempt in range(1, traffic.settings["max_attempts"] + 1):
+                lease = traffic.acquire(route, model, deadline, self.cancelled)
+                if self.cancelled():
+                    traffic.note("cancelled")
+                    raise ClientGone()
+                if is_bcu and "Authorization" not in headers:
+                    # Read once per logical request, after it reaches the front
+                    # of the queue. Never cache credentials across requests.
+                    headers["Authorization"] = "Bearer " + self.server.key_reader()
+                if self.cancelled():
+                    traffic.note("cancelled")
+                    raise ClientGone()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TrafficBusy("BCU's request wait budget was reached.")
+                if attempt > 1:
+                    traffic.note("retries")
+                upstream = connection_type(target.hostname, target.port, timeout=min(180, remaining))
+                upstream.request("POST", path, body, headers)
+                response = upstream.getresponse()
+                metadata = response_metadata(response)
+                self.server.record_status(route, model, response.status, metadata.get("retry-after"))
+                prefix = b""
+                if response.status in (429, 503, 402):
+                    # Retain the prefix for transparent native error forwarding.
+                    # Never persist error text or expose it through diagnostics.
+                    prefix = response.read(65536)
+                    hint = retry_after_seconds(metadata.get("retry-after"))
+                    if ((len(prefix) < 65536 or response.isclosed())
+                            and retryable_response(response.status, prefix, hint, response.getheader("Content-Encoding"))):
+                        until = traffic.cooldown(lease, hint)
+                        if attempt < traffic.settings["max_attempts"] and until < deadline:
+                            upstream.close()
+                            upstream = None
+                            traffic.release(lease)
+                            lease = None
+                            continue
+                if 200 <= response.status < 300:
+                    traffic.success(lease)
+                    if attempt > 1:
+                        traffic.note("recovered")
+                break
+            # The wait budget ends once a response is selected. Successful
+            # streams retain the existing idle timeout; they are never replayed.
+            if upstream.sock:
+                upstream.sock.settimeout(180)
             if is_bcu and not 200 <= response.status < 300:
                 error_type, code = "bcu_upstream_error", None
                 if response.status == 429:
                     error_type, code = "rate_limit_error", "rate_limit_exceeded"
-                    message = (f"OpenRouter rate-limited {model} (HTTP 429). Honor Retry-After when provided; "
+                    message = (f"OpenRouter rate-limited {model} (HTTP 429) after {attempt} BCU attempt(s). Honor Retry-After when provided; "
                                "reduce parallel tasks/subagents or choose another model. "
                                "Check bobocodexultra doctor for recent errors.")
                 elif response.status == 402:
@@ -684,6 +939,9 @@ class Handler(BaseHTTPRequestHandler):
             self.started = True
             self.close_connection = True
             if not is_bcu:
+                if prefix:
+                    self.wfile.write(prefix)
+                    self.wfile.flush()
                 while chunk := response.read1(65536):
                     self.wfile.write(chunk)
                     self.wfile.flush()
@@ -704,8 +962,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.server.record_usage(result, model)
                 result["output"] = [bridge.output(i) for i in result.get("output", [])]
                 self.wfile.write(json.dumps(result).encode())
+        except ClientGone:
+            self.close_connection = True
+        except TrafficBusy as exc:
+            if not self.cancelled():
+                self.error(503, str(exc), metadata={"Retry-After": str(exc.retry_after)}, code="bcu_queue_busy")
         except (BrokenPipeError, ConnectionResetError):
-            pass  # Disconnect cancels the upstream by closing it in finally.
+            if not self.started and not self.cancelled():
+                self.error(502, "The upstream connection closed before responding. BCU did not replay this request.")
+            self.close_connection = True
         except (OSError, ValueError, KeyError, TypeError, http.client.HTTPException, subprocess.TimeoutExpired) as exc:
             with self.server.count_lock:
                 self.server.counts["errors"] += 1
@@ -717,6 +982,9 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             if upstream:
                 upstream.close()
+            if lease:
+                traffic.release(lease)
+            traffic.resize(buffered, 0)
             self.server.slots.release()
 
     def sse(self, frame, bridge, model):

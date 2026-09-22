@@ -226,6 +226,11 @@ def doctor() -> None:
             UI.row("GUI THINKING", "low / medium / high advertised for all selected BCU models", "mint")
     if runtime:
         UI.row("REQUESTS", json.dumps(runtime.get("counts", {})))
+        if scheduling := runtime.get("traffic"):
+            for route in ("native", "openrouter"):
+                UI.row(route.upper() + " TRAFFIC", f"{scheduling['active'][route]} active · "
+                       f"{scheduling['queued'][route]} queued · limit {scheduling['settings'][route + '_concurrency']}")
+            UI.row("AUTO RETRIES", json.dumps(scheduling["metrics"]))
         for event in runtime.get("recent_errors", [])[-5:]:
             when = time.strftime("%H:%M:%S", time.localtime(event["timestamp"]))
             retry = event.get("retry_after_seconds")
@@ -233,9 +238,34 @@ def doctor() -> None:
             UI.row("UPSTREAM ERROR", f"{when} · {safe_text(event['route'])} · {safe_text(event['model'])} · "
                    f"HTTP {event['status']}{hint}", "amber")
         if runtime.get("counts", {}).get("rate_limits"):
-            UI.row("RATE LIMITS", "Wait for the upstream retry window; reduce simultaneous tasks/subagents. "
-                   "For OpenRouter models, also check that provider's limits. Counts reset when the router restarts.", "amber")
+            UI.row("RATE LIMITS", "BCU coordinates cooldowns and bounded retries. Check `bobocodexultra traffic` "
+                   "for current queues; persistent limits still require provider/account review.", "amber")
     UI.row("RECOVERY", "`bobocodexultra on` repairs a stopped service; `off` restores native desktop settings.")
+
+
+def traffic_status(as_json=False):
+    runtime = router_module().health()
+    scheduling = runtime.get("traffic")
+    if as_json:
+        print(json.dumps({"running": bool(runtime), "traffic": scheduling}, indent=2))
+        return
+    if not scheduling:
+        UI.row("TRAFFIC", "Scheduler unavailable. Install the latest BCU and run `bobocodexultra on`.", "amber")
+        return
+    UI.section("Concurrent requests")
+    for route in ("native", "openrouter"):
+        UI.row(route.upper(), f"{scheduling['active'][route]} active / {scheduling['settings'][route + '_concurrency']} · "
+               f"{scheduling['queued'][route]} queued / {scheduling['settings']['queue_limit']} waiting slots")
+    UI.row("RETRIES", f"{scheduling['settings']['max_attempts']} attempts maximum · "
+           f"{scheduling['settings']['request_timeout']}s queue/retry budget per request")
+    UI.row("TOTALS", json.dumps(scheduling["metrics"]))
+    UI.row("BUFFER BUDGET", f"{scheduling['buffered_bytes'] / 1024**2:.1f} / {scheduling['settings']['body_budget_mb']} MiB accounted")
+    for model in scheduling["models"]:
+        UI.row(safe_text(model["model"], 60), f"{model['route']} · {model['active']} active · {model['queued']} queued · "
+               f"{model['cooldown_seconds']}s cooldown" + (" · recovery probe" if model["recovering"] else ""))
+    if scheduling["additional_models"]:
+        UI.row("MORE", f"{scheduling['additional_models']} additional model entries not shown")
+    UI.row("CONFIG", "Optional limits: $CODEX_HOME/bcu/traffic.json (see docs/TRAFFIC.md). Totals reset on restart.")
 
 
 def desktop_home() -> None:
@@ -253,6 +283,7 @@ def desktop_home() -> None:
                              ("agents", "Set up Codex subagent defaults"),
                              ("off", "Return to your previous desktop setup"),
                              ("doctor", "Check and troubleshoot desktop routing"),
+                             ("traffic", "See active requests, queues, cooldowns and automatic retries"),
                              ("docs", "Read the full command guide")):
         UI.row(command, purpose)
     UI.row("RELOAD", "Quit and reopen Codex after changing modes or model selections.", "amber")
@@ -1875,6 +1906,13 @@ def docs(topic: str) -> None:
             ("menu", "Open or install the BCU macOS menu bar companion."),
             ("menu install", "Build a signed local app, open it, and launch it automatically at login."),
         ],
+        "traffic": [
+            ("traffic", "Show active/queued requests, model cooldowns and automatic-retry totals."),
+            ("traffic --json", "Machine-readable scheduler snapshot; contains no prompts or credentials."),
+            ("automatic scheduling", "Separate native/OpenRouter capacity, per-model limits, bounded queues and cooldown recovery probes."),
+            ("automatic retry", "Up to six attempts within a 180-second wait budget for temporary 429/503 rejections; no replay after streaming starts."),
+            ("configuration", "Optional $CODEX_HOME/bcu/traffic.json overrides; see docs/TRAFFIC.md. Run on when tasks are idle to reload."),
+        ],
         "setup": [
             ("setup --check", "Read-only macOS, Python, Codex CLI and config preflight; safe in scripts."),
             ("setup", "Interactive terminal wizard: install CLI, choose models, secure Keychain prompt, enable desktop, optional agents."),
@@ -1956,6 +1994,8 @@ def main() -> None:
     auth_sub.add_parser("status", help="Check Keychain item presence without reading the key")
     sub.add_parser("status", help="Show complete configuration status")
     sub.add_parser("doctor", help="Check the shared desktop router and configuration")
+    traffic_parser = sub.add_parser("traffic", help="Show queues, concurrency, cooldowns, and automatic retries")
+    traffic_parser.add_argument("--json", action="store_true", help="Emit a machine-readable scheduler snapshot")
     menu_parser = sub.add_parser("menu", help="Open or install the native macOS menu bar app")
     menu_parser.add_argument("action", nargs="?", choices=("open", "install"), default="open")
     usage_parser = sub.add_parser("usage", help="Report locally recorded BCU tokens and estimated cost")
@@ -1977,7 +2017,7 @@ def main() -> None:
     for game in ("snake", "pong", "doom"):
         sub.add_parser(game, help=f"Play {game.capitalize()} offline in the terminal")
     docs_parser = sub.add_parser("docs", help="Read built-in command documentation")
-    docs_parser.add_argument("topic", nargs="?", choices=("setup", "auth", "model", "agents", "desktop", "codex", "games"), default="all")
+    docs_parser.add_argument("topic", nargs="?", choices=("setup", "auth", "model", "agents", "desktop", "codex", "traffic", "games"), default="all")
     desktop_sub = sub.add_parser("desktop", help="Control shared desktop routing (shortcuts: on / off)").add_subparsers(dest="action", required=True)
     desktop_sub.add_parser("on", help="Enable ChatGPT, Ollama and BCU models side by side")
     desktop_sub.add_parser("off", help="Restore the previous native/Ollama desktop configuration")
@@ -2007,12 +2047,12 @@ def main() -> None:
         UI.motion = False
     if args.no_animate:
         UI.motion = False
-    if args.command not in ("snake", "pong", "doom") and (args.command != "codex" or args.action != "launch") and not (args.command == "usage" and args.json):
+    if args.command not in ("snake", "pong", "doom") and (args.command != "codex" or args.action != "launch") and not (args.command in ("usage", "traffic") and args.json):
         UI.heading({"setup": "Guided setup", "auth": "Secure access", "model": "Model selector", "reasoning": "Reasoning control",
                     "agents": "Codex agents", "desktop": "Desktop mode",
                     "codex": "Codex operations", "docs": "Field guide", "status": "System check",
                     "usage": "Token & cost ledger", "reset": "Native Codex reset",
-                    "doctor": "Desktop health", "menu": "Menu bar", "install": "Command installer"}.get(args.command, "Codex Desktop"))
+                    "doctor": "Desktop health", "traffic": "Traffic control", "menu": "Menu bar", "install": "Command installer"}.get(args.command, "Codex Desktop"))
     try:
         if args.command is None:
             desktop_home()
@@ -2034,6 +2074,8 @@ def main() -> None:
             status()
         elif args.command == "doctor":
             doctor()
+        elif args.command == "traffic":
+            traffic_status(args.json)
         elif args.command == "menu":
             menu_install() if args.action == "install" else menu_open()
         elif args.command == "usage":
